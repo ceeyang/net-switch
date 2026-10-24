@@ -30,6 +30,14 @@ type Durable struct {
 	path        string
 	failed      error
 	issuedEpoch uint64
+	// committed is set once this instance has saved a revision of its own.
+	// Until then the record's N and hash are an earlier instance's history,
+	// which spec §3.3 keeps as history only: a restarted engine has no loaded
+	// revision, so it starts from whatever revision Control sends first, even
+	// one numbered below that history (Control's journal may have been
+	// recovered from defaults). The guard below protects only the history this
+	// instance commits itself.
+	committed bool
 }
 
 func Open(path, instance string, save func(Record) error) (*Durable, error) {
@@ -48,10 +56,11 @@ func Open(path, instance string, save func(Record) error) (*Durable, error) {
 		if err := json.Unmarshal(b, &old); err != nil {
 			return nil, fmt.Errorf("invalid native service state: %w", err)
 		}
-		// A stand-in state must be retired by the migration path, never read
-		// as a fresh native instance or silently reset to epoch zero.
+		// Stand-in state is never read as a fresh native instance or silently
+		// reset to epoch zero. The pre-release stand-in folder is retired by
+		// hand; there is no migration because it never shipped.
 		if old.Schema != 1 {
-			return nil, errors.New("native service state schema is not supported")
+			return nil, errors.New("engine-state.json is not native service state: this data folder belonged to a pre-release stand-in build; run that build's uninstall or remove the folder")
 		}
 	}
 	next := old
@@ -96,7 +105,7 @@ func (d *Durable) SaveApplied(a policy.Applied) error {
 	if d.failed != nil {
 		return d.failed
 	}
-	if a.N < d.record.N || a.N == d.record.N && a.Hash != d.record.Hash {
+	if d.committed && (a.N < d.record.N || a.N == d.record.N && a.Hash != d.record.Hash) {
 		return errors.New("native revision history cannot go backwards or change its hash")
 	}
 	next := d.record
@@ -106,6 +115,7 @@ func (d *Durable) SaveApplied(a policy.Applied) error {
 		return err
 	}
 	d.record = next
+	d.committed = true
 	return nil
 }
 
@@ -125,6 +135,21 @@ func (d *Durable) reloadCommitted() {
 		return
 	}
 	d.record.Epoch = max(d.record.Epoch, r.Epoch)
+	if !d.committed {
+		// This instance has no history of its own yet. If the interrupted
+		// first commit reached the disk, that revision is the one to continue
+		// from; if the file still holds the inherited history, nothing is
+		// committed yet. That includes a first commit equal to the inherited
+		// {N, hash} whose sync failed: it was never acknowledged, so per spec
+		// §3.3 this instance still has no history to guard and its next
+		// revision, lower or not, is its first (a design decision recorded in
+		// the review of this change).
+		if r.N != d.record.N || r.Hash != d.record.Hash {
+			d.record.N, d.record.Hash = r.N, r.Hash
+			d.committed = true
+		}
+		return
+	}
 	if r.N > d.record.N {
 		d.record.N, d.record.Hash = r.N, r.Hash
 	}

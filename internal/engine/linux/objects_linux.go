@@ -62,8 +62,15 @@ func (d objectDriver) Replace(ctx context.Context, before, after journal.Fingerp
 }
 
 func (o *objects) fingerprint(v any) journal.Fingerprint {
+	return journal.Fingerprint{"boot": o.boot, "netns": o.netns, "object": ObjectJSON(v)}
+}
+
+// ObjectJSON is the "object" field of a Linux ownership record: the netlink
+// rule, route, address or TUN exactly as the engine journals it. The hosted
+// suite decodes live records with it to compare them with the kernel's state.
+func ObjectJSON(v any) string {
 	b, _ := json.Marshal(v)
-	return journal.Fingerprint{"boot": o.boot, "netns": o.netns, "object": string(b)}
+	return string(b)
 }
 func (d objectDriver) Validate(f journal.Fingerprint) error {
 	if len(f) != 3 || f["boot"] == "" || f["netns"] == "" || !json.Valid([]byte(f["object"])) {

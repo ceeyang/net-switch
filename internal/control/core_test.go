@@ -149,6 +149,12 @@ type fakeEngine struct {
 	// ackPoint, when set, makes the fake answer like the native engine: every
 	// acknowledgement carries a growing apply point.
 	ackPoint uint64
+	// refuse, when set, makes every start fail the way the native client
+	// reports an engine that answered with an error and kept running: Start
+	// returns engine.StartRefused and the snapshot shows the error with no
+	// FailureID, so only Start's result counts.
+	refuse   error
+	refusals int
 }
 type recordedReply struct {
 	Route  string
@@ -194,6 +200,12 @@ func (f *fakeEngine) Start(ctx context.Context, p engine.Policy) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "start")
+	if f.refuse != nil {
+		f.refusals++
+		message := f.refuse.Error()
+		f.s.Status, f.s.Error, f.s.Instance, f.s.FailureID = "error", &message, "test-engine", ""
+		return &engine.StartRefused{Instance: "test-engine", Attempt: uint64(f.refusals), Err: f.refuse}
+	}
 	f.s.Status = "on"
 	f.s.Instance = "test-engine"
 	f.s.Policy = p

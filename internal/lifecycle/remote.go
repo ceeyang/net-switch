@@ -41,9 +41,12 @@ type Remote struct {
 	recovering, stopping bool
 	recovery             uint64
 	attempt              uint64
-	forgotten            map[string]uint64
-	forgetSequence       uint64
-	dial                 func(context.Context, localipc.Endpoint) (*localipc.Conn, error)
+	// beforeLoad runs between fixing the attempt's session and sending the
+	// start; nil in production, a test hook for the reattach race.
+	beforeLoad     func()
+	forgotten      map[string]uint64
+	forgetSequence uint64
+	dial           func(context.Context, localipc.Endpoint) (*localipc.Conn, error)
 	// dialAdapter writes the M2 primer; dialNative does not. nativeInstalled
 	// reads the installation to choose between them (see dialInstalled).
 	dialAdapter, dialNative func(context.Context, localipc.Endpoint) (*localipc.Conn, error)
@@ -100,12 +103,32 @@ func (r *Remote) Snapshot() ce.Snapshot {
 	}
 	return s
 }
+
+// Fail shows an error Control itself decided (the five-failure latch, missing
+// administrator rights). Nothing ended, so it mints no FailureID: an existing
+// instance-ending identity stays, and a shown refusal stays uncountable.
+// Minting one here made the fifth refusal's latch display count as a sixth
+// failure on the next status read.
 func (r *Remote) Fail(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	message := err.Error()
+	r.snapshot.Status = "error"
+	r.snapshot.Error = &message
+}
+
+// failInstance publishes an instance-ending outcome Remote itself observed.
+func (r *Remote) failInstance(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.failLocked(err)
 }
 func (r *Remote) failLocked(err error) { r.failWithReasonLocked(err, "") }
+
+// failWithReasonLocked publishes an instance-ending outcome: an error with a
+// FailureID Control counts once. A start the engine refused while its instance
+// kept running is not published this way; it goes back to Control in Start's
+// result (ce.StartRefused), and the status shown meanwhile carries no FailureID.
 func (r *Remote) failWithReasonLocked(err error, reason string) {
 	message := err.Error()
 	if r.snapshot.Status != "error" || r.snapshot.FailureID == "" {
@@ -125,7 +148,12 @@ func (r *Remote) disconnect(rpc *RPC, err error) {
 		return
 	}
 	r.rpc = nil
-	if r.snapshot.Status != "error" {
+	// Until recovery has classified this instance's outcome, Control must not
+	// be able to restart: a shown refusal (an error with no FailureID) would
+	// otherwise count as restartable once its backoff passed, a replacement
+	// could attach first, and the death would never be reported. An
+	// instance-ending error already classified keeps its status and identity.
+	if r.snapshot.Status != "error" || r.snapshot.FailureID == "" {
 		r.snapshot.Status = "starting"
 	}
 	already := r.recovering
@@ -323,9 +351,8 @@ func (r *Remote) Attach(ctx context.Context, start bool) error {
 		r.snapshot = r.nativeSnapshotLocked(hello.Status)
 	}
 	r.snapshot.Instance = hello.Instance
-	if r.snapshot.Status == "error" {
-		r.snapshot.FailureID = hello.Instance
-	}
+	// An error status of a running instance (a start it refused) is shown,
+	// not counted: it carries no FailureID. Only instance-ending outcomes do.
 	if start && r.snapshot.Status != "on" {
 		r.snapshot.Status = "starting"
 		r.snapshot.Error = nil
@@ -392,16 +419,24 @@ func (r *Remote) request(ctx context.Context, method string, payload any, opID, 
 // instance, and the request itself carries that instance and epoch, so a
 // replacement attached in between is rejected by the engine, never by luck.
 func (r *Remote) fencedRequest(ctx context.Context, fence, method string, payload any, opID, cursor string, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
 	r.mu.Lock()
 	rpc, instance, epoch := r.rpc, r.instance, r.epoch
 	r.mu.Unlock()
-	if rpc == nil {
-		return errors.New("engine service is not attached")
-	}
 	if fence != "" && fence != instance {
 		return fmt.Errorf("%s belongs to engine instance %s; the attached instance is %s", method, fence, instance)
+	}
+	return r.sendOn(ctx, rpc, instance, epoch, method, payload, opID, cursor, out)
+}
+
+// sendOn sends one request on a session fixed by the caller, addressed to the
+// instance and epoch that session attached, so a reattach between the
+// caller's capture and the send can neither redirect the request nor let its
+// answer be taken for another session's.
+func (r *Remote) sendOn(ctx context.Context, rpc *RPC, instance string, epoch uint64, method string, payload any, opID, cursor string, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	if rpc == nil {
+		return errors.New("engine service is not attached")
 	}
 	request := map[string]any{"method": method, "engineInstanceId": instance, "epoch": epoch}
 	switch fields := payload.(type) {
@@ -452,6 +487,7 @@ func (r *Remote) Start(ctx context.Context, p ce.Policy) error {
 	r.mu.Lock()
 	r.stopping = false
 	r.attempt++
+	attempt := r.attempt
 	// Failures before an instance exists belong to this one start attempt.
 	if r.rpc == nil && !r.recovering {
 		r.instance = ""
@@ -465,7 +501,7 @@ func (r *Remote) Start(ctx context.Context, p ce.Policy) error {
 	if err := r.Attach(ctx, true); err != nil {
 		status, queryErr := r.queryService(service.Engine)
 		if queryErr == nil && status.Stopped {
-			r.Fail(err)
+			r.failInstance(err)
 		} else {
 			// SCM may still be bringing up the instance after our wait timed
 			// out. Keep following it; do not leave a permanent "starting".
@@ -473,21 +509,42 @@ func (r *Remote) Start(ctx context.Context, p ce.Policy) error {
 		}
 		return err
 	}
+	// The session, instance and attempt this request belongs to are fixed
+	// before it is sent, the request goes out on that very session, and its
+	// outcome is published only if that session is still the attached one.
 	r.mu.Lock()
 	revision, native, running := r.desired, r.native, r.snapshot.Status == "on"
+	rpc, instance, epoch := r.rpc, r.instance, r.epoch
 	r.mu.Unlock()
 	if revision == nil || !reflect.DeepEqual(revision.Policy, p) {
 		return errors.New("start requires a durable complete desired revision")
 	}
+	if r.beforeLoad != nil {
+		r.beforeLoad()
+	}
 	if native {
-		if _, err := r.nativeLoad(ctx, *revision, running); err != nil {
-			r.mu.Lock()
-			rpc := r.rpc
-			r.mu.Unlock()
-			if rpc != nil && isRPCRejection(err) {
-				// The engine refused and stays attached; its status (error
-				// with lastError, or still off) is what Control classifies.
-				_ = r.refresh(ctx)
+		if _, err := r.nativeLoad(ctx, rpc, instance, epoch, *revision, running); err != nil {
+			if isRPCRejection(err) {
+				// The engine answered and stays attached, so this attempt
+				// failed while the instance lives on. That is a failed start
+				// (spec §2), and it is counted exactly once by Control from
+				// this call's own result; the status shown meanwhile carries no
+				// FailureID, so no poll, reattach or retry can count it again.
+				// A transport error takes the other branch; its outcome is
+				// published once by connection recovery, never here as well.
+				// A refused apply on an engine that was already on is not a
+				// failed start: forwarding continues on the loaded revision and
+				// Control resolves the conflict by raising its number (§3.3).
+				if running {
+					return err
+				}
+				r.mu.Lock()
+				if r.rpc == rpc && rpc != nil && r.instance == instance && !r.stopping {
+					message := err.Error()
+					r.snapshot.Status, r.snapshot.Error, r.snapshot.Reason, r.snapshot.FailureID = "error", &message, "", ""
+				}
+				r.mu.Unlock()
+				return &ce.StartRefused{Instance: instance, Attempt: attempt, Err: err}
 			} else if rpc != nil {
 				r.disconnect(rpc, err)
 			}
@@ -516,7 +573,7 @@ func (r *Remote) Restore(revision *ce.Revision) { r.mu.Lock(); r.desired = revis
 func (r *Remote) Apply(ctx context.Context, revision ce.Revision) (ce.Acknowledgement, error) {
 	r.Restore(&revision)
 	r.mu.Lock()
-	rpc, native := r.rpc, r.native
+	rpc, native, instance, epoch := r.rpc, r.native, r.instance, r.epoch
 	s := r.snapshot
 	r.mu.Unlock()
 	if rpc == nil || s.Status != "on" {
@@ -525,7 +582,7 @@ func (r *Remote) Apply(ctx context.Context, revision ce.Revision) (ce.Acknowledg
 		return ce.Acknowledgement{Number: revision.Number, Hash: revision.Hash, Instance: s.Instance}, nil
 	}
 	if native {
-		ack, err := r.nativeLoad(ctx, revision, true)
+		ack, err := r.nativeLoad(ctx, rpc, instance, epoch, revision, true)
 		if err == nil {
 			err = r.refresh(ctx)
 		}

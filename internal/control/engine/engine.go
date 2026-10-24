@@ -45,6 +45,21 @@ type Snapshot struct {
 
 const ReasonAdapterLost = "adapter-lost"
 
+// StartRefused is Start's result when the engine answered the start with an
+// error and its instance kept running. It is a failed start attempt (spec §2:
+// it counts toward the backoff and the five-failure latch), and it is counted
+// exactly once, by the caller of Start, from this value. Status reads of the
+// still-running instance show the error but never count: only instance-ending
+// outcomes carry a FailureID.
+type StartRefused struct {
+	Instance string
+	Attempt  uint64
+	Err      error
+}
+
+func (e *StartRefused) Error() string { return e.Err.Error() }
+func (e *StartRefused) Unwrap() error { return e.Err }
+
 type Revision struct {
 	Number uint64 `json:"n"`
 	Hash   string `json:"sha256"`
@@ -146,6 +161,8 @@ type Accounting interface {
 type Engine interface {
 	Snapshot() Snapshot
 	// Fail reports a control-side prerequisite failure without starting the engine.
+	// Fail shows an error Control decided (the latch, missing rights). It is
+	// display only: no instance ended, so it must never produce a FailureID.
 	Fail(error)
 	Start(context.Context, Policy) error
 	Stop(context.Context) error

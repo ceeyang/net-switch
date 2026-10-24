@@ -96,6 +96,10 @@ func pinIdentity(value string, rules apppath.Rules) (string, bool) {
 func nativeRevision(r ce.Revision) (policy.Revision, error) {
 	return nativeRevisionWith(r, appIdentityRules)
 }
+
+// NativeRevision is the compilation Control sends the engine, exported for
+// hosted fixtures that act as a controller over Control's durable journal.
+func NativeRevision(r ce.Revision) (policy.Revision, error) { return nativeRevision(r) }
 func nativeRevisionWith(r ce.Revision, rules apppath.Rules) (policy.Revision, error) {
 	p := r.Policy
 	config := policy.Config{Combine: p.Combine, IPv6: p.IPv6, AppLines: map[string]string{}, Shares: map[string]uint64{}, Lanes: map[string]string{}, Blocked: []string{}}
@@ -148,10 +152,13 @@ func (r *Remote) nativeSnapshotLocked(status protocol.Status) ce.Snapshot {
 	if s.Status == "" {
 		s.Status = "off"
 	}
+	// The error of a running instance (a start it refused) is shown to the
+	// UI but never counted: no FailureID. Control counted the refusal once,
+	// from Start's own result; instance-ending outcomes get their identity
+	// from exit classification.
 	if s.Status == "error" && status.LastError != "" {
 		message := status.LastError
 		s.Error = &message
-		s.FailureID = status.Instance
 	}
 	if status.Applied != nil {
 		s.AppliedRevision, s.AppliedHash, s.AppliedPoint = status.Applied.N, status.Applied.Hash, status.Applied.Point
@@ -189,7 +196,7 @@ func (r *Remote) nativeRefresh(ctx context.Context) error {
 
 // nativeLoad sends start or apply. An engine that is already on receives apply,
 // which the table answers idempotently; start is only for a fresh instance.
-func (r *Remote) nativeLoad(ctx context.Context, revision ce.Revision, running bool) (ce.Acknowledgement, error) {
+func (r *Remote) nativeLoad(ctx context.Context, rpc *RPC, instance string, epoch uint64, revision ce.Revision, running bool) (ce.Acknowledgement, error) {
 	native, err := nativeRevision(revision)
 	if err != nil {
 		return ce.Acknowledgement{}, err
@@ -199,15 +206,12 @@ func (r *Remote) nativeLoad(ctx context.Context, revision ce.Revision, running b
 		method = "apply"
 	}
 	var applied policy.Applied
-	if err := r.call(ctx, method, map[string]any{"revision": native}, "", &applied); err != nil {
+	if err := r.sendOn(ctx, rpc, instance, epoch, method, map[string]any{"revision": native}, "", "", &applied); err != nil {
 		return ce.Acknowledgement{}, err
 	}
 	if applied.N != native.N || applied.Hash != native.Hash {
 		return ce.Acknowledgement{}, errors.New("engine acknowledged a different revision")
 	}
-	r.mu.Lock()
-	instance := r.instance
-	r.mu.Unlock()
 	return ce.Acknowledgement{Number: revision.Number, Hash: revision.Hash, Instance: instance, Point: applied.Point}, nil
 }
 
