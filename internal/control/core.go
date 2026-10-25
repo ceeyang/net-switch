@@ -143,6 +143,8 @@ type Core struct {
 	monitorFailures, scanFailures, retryAttempts int
 	retryAt, elevationAt, sharesAt               int64
 	ipv6Since                                    *int64
+	ipv6Instance                                 string
+	ipv6Loaded, ipv6Known                        bool
 	policy                                       any
 	autostart                                    any
 	offer                                        *updates.Offer
@@ -653,7 +655,7 @@ func (c *Core) policyLocked() engine.Policy {
 	for id, l := range c.lanes {
 		up[id] = l.health.Up != nil && *l.health.Up
 	}
-	p := engine.Policy{Lines: items, AppLines: append(apps.Pins{}, c.pinsLocked()...), Combine: js.Truth(c.values["combine"]), Shares: c.sharesLocked(items), Blocked: []string{}, Lanes: map[string]string{}, IPv6: c.ipv6Locked()}
+	p := engine.Policy{Lines: items, AppLines: append(apps.Pins{}, c.pinsLocked()...), Combine: js.Truth(c.values["combine"]), Shares: c.sharesLocked(items), Blocked: []string{}, Lanes: map[string]string{}, IPv6: c.effectiveIPv6Locked()}
 	current := c.op.Engine.Snapshot()
 	if p.Combine && current.Policy.Combine && c.values["combineMode"] == "auto" && len(p.Shares) == len(current.Policy.Shares) {
 		sameIDs, moved := true, false
@@ -710,6 +712,48 @@ func (c *Core) ipv6Locked() bool {
 		}
 	}
 	return true
+}
+
+// Every native policy writer uses the same settlement, including cap closures
+// and unrelated settings edits. Raw availability and the UI's loaded policy
+// remain separate. Physical address-loss closures are owned by the platform.
+func (c *Core) effectiveIPv6Locked() bool {
+	wanted := c.ipv6Locked()
+	if !c.op.ServiceMode {
+		return wanted
+	}
+	s := c.op.Engine.Snapshot()
+	if s.Status != "on" {
+		c.ipv6Since, c.ipv6Known, c.ipv6Instance = nil, false, ""
+		return wanted // a fresh start uses current configuration
+	}
+	if s.Instance != c.ipv6Instance {
+		c.ipv6Since, c.ipv6Known, c.ipv6Instance = nil, false, s.Instance
+	}
+	if s.StartedWith != nil {
+		loaded := s.StartedWith.IPv6
+		if !c.ipv6Known || loaded != c.ipv6Loaded {
+			c.ipv6Since = nil
+		}
+		c.ipv6Loaded, c.ipv6Known = loaded, true
+	}
+	// A temporarily unknown loaded revision must not erase an observation from
+	// this instance (for example after a rejected apply or a lost reply).
+	if !c.ipv6Known {
+		return wanted
+	}
+	if wanted == c.ipv6Loaded {
+		c.ipv6Since = nil
+		return c.ipv6Loaded
+	}
+	now := c.now()
+	if c.ipv6Since == nil {
+		c.ipv6Since = ptr(now)
+	}
+	if now-*c.ipv6Since < 30000 {
+		return c.ipv6Loaded
+	}
+	return wanted // keep the deadline until acknowledgement, for immediate retry
 }
 func (c *Core) CheckElevation(ctx context.Context) {
 	v, err := c.op.Platform.Call(ctx, "elevated", nil)
@@ -1057,14 +1101,19 @@ func (c *Core) Supervise(ctx context.Context) error {
 		settledIPv6 := false
 		if s.StartedWith != nil {
 			restart = restart || c.bindingChangedLocked(s)
-			if c.ipv6Locked() == s.StartedWith.IPv6 {
+			if c.op.ServiceMode {
+				settledIPv6 = c.effectiveIPv6Locked() != s.StartedWith.IPv6
+				restart = restart || settledIPv6
+			} else if c.ipv6Locked() == s.StartedWith.IPv6 {
 				c.ipv6Since = nil
 			} else if c.ipv6Since == nil {
 				c.ipv6Since = ptr(now)
 			} else if now-*c.ipv6Since >= 30000 {
 				restart = true
 				settledIPv6 = true
-				c.ipv6Since = nil
+				if !c.op.ServiceMode {
+					c.ipv6Since = nil
+				}
 			}
 		}
 		c.mu.Unlock()
@@ -1079,6 +1128,35 @@ func (c *Core) Supervise(ctx context.Context) error {
 					needed = needed || (settledIPv6 && c.ipv6Locked() != fresh.StartedWith.IPv6)
 				}
 				needed = needed && c.wanted && !c.quitting && fresh.Status == "on"
+				if c.op.ServiceMode {
+					needed = needed && !c.powerSuspended
+					c.mu.Unlock()
+					if !needed {
+						return nil
+					}
+					// Native Apply preserves the instance and existing flows. Route
+					// reconciliation and IPv6-only closure belong to the engine;
+					// Stop would also destroy unrelated IPv4 connections (§5.7).
+					if err := c.ApplyPolicy(ctx); err != nil {
+						c.log("could not apply live network change: %v", err)
+						return err
+					}
+					applied := c.op.Engine.Snapshot().Policy
+					if rebound {
+						aliases := make([]string, 0, len(applied.Lines))
+						for _, line := range applied.Lines {
+							aliases = append(aliases, line.Alias)
+						}
+						c.log("routing updated to use %s without restarting", strings.Join(aliases, ", "))
+					} else if settledIPv6 {
+						if applied.IPv6 {
+							c.log("every line has IPv6 now: routing carries it without restarting")
+						} else {
+							c.log("a line lost IPv6: routing keeps apps on IPv4 without restarting")
+						}
+					}
+					return nil
+				}
 				if needed && hung {
 					c.log("the routing engine hasn't answered for %d polls; restarting it", c.monitorFailures)
 				} else if needed && rebound {
