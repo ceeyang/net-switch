@@ -122,4 +122,4 @@ SEC("cgroup_skb/egress") int observe_packet(void *ctx) {
     return 1;
 }
 
-char license[] SEC("license") = "Dual MIT/GPL";
+char ns_owner_license[] SEC("license") = "Dual MIT/GPL";
