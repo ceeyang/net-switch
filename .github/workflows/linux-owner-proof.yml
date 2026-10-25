@@ -1,0 +1,75 @@
+name: Linux owner foundations proof
+
+# Deliberately manual. Parent reviews this bounded pilot before dispatch.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  objects:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Rebuild original objects twice with pinned compiler bytes
+        run: node scripts/generate-owner-bpf.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owner-proof-objects
+          path: |
+            dist/ownerbpf/first/*
+            dist/ownerbpf/manifest.json
+          if-no-files-found: error
+  modern:
+    needs: objects
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            object: proof_x86_bpfel.o
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            object: proof_arm64_bpfel.o
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: owner-proof-objects
+          path: dist/ownerbpf
+      - name: Compile fixture and run pure checks
+        run: |
+          go test -p=2 -mod=vendor -v ./internal/engine/linux/ownerbpf
+          go test -p=2 -mod=vendor -tags=ownerbpfproof -c -o dist/owner-proof ./internal/engine/linux/ownerbpf
+      - name: Bounded real kernel fixtures, no engine or service
+        run: |
+          sudo env GOMAXPROCS=2 NS_OWNERBPF_PROOF=1 NS_OWNERBPF_OBJECT="$PWD/dist/ownerbpf/first/${{ matrix.object }}" unshare --net -- dist/owner-proof -test.v -test.timeout=60s -test.run='^TestKernelProof$'
+  qualification:
+    needs: [objects, modern]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Unmet requirements remain red
+        run: |
+          echo 'UNMET: actual Linux 5.8 amd64 and arm64 guests have not been provisioned or run.'
+          echo 'UNMET: complete validated app identity after immediate exit/exec.'
+          echo 'BLOCKED: tuple-only TUN association cannot distinguish queued generations.'
+          echo 'This is evidence gathering, not release qualification. Unknown counts as a miss.'
+          exit 1

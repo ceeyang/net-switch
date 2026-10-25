@@ -1,0 +1,583 @@
+//go:build linux && ownerbpfproof
+
+package ownerbpf
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+)
+
+// This opt-in suite fails missing infrastructure; it never skips a proof.
+// The child writes directly to an inherited connected socket. The socket's
+// creator, idle holder and sender are therefore independently known by the test.
+func TestProofChild(t *testing.T) {
+	mode := os.Getenv("NS_OWNER_CHILD")
+	if mode == "" {
+		return
+	}
+	if mode == "loader" {
+		p, err := Load(os.Getenv("NS_OWNERBPF_OBJECT"), os.Getenv("NS_OWNER_CGROUP"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(73)
+		}
+		var ids attachmentIDs
+		for _, l := range p.links {
+			info, err := l.Info()
+			if err != nil {
+				os.Exit(74)
+			}
+			ids.Links = append(ids.Links, info.ID)
+		}
+		for _, prog := range p.Collection.Programs {
+			info, err := prog.Info()
+			if err != nil {
+				os.Exit(75)
+			}
+			id, ok := info.ID()
+			if !ok {
+				os.Exit(76)
+			}
+			ids.Programs = append(ids.Programs, id)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(ids); err != nil {
+			os.Exit(77)
+		}
+		for {
+			time.Sleep(time.Hour)
+			runtime.KeepAlive(p)
+		}
+	}
+	if mode == "barrier" {
+		var release [1]byte
+		if _, err := unix.Read(4, release[:]); err != nil {
+			os.Exit(78)
+		}
+	}
+	if _, err := unix.Write(3, []byte("same-datagram")); err != nil {
+		os.Exit(71)
+	}
+	if mode == "exec" {
+		if err := os.Setenv("NS_OWNER_CHILD", "exit"); err != nil {
+			os.Exit(72)
+		}
+		exe, _ := os.Executable()
+		if err := unix.Exec(exe, []string{exe, "-test.run=^TestProofChild$"}, os.Environ()); err != nil {
+			os.Exit(72)
+		}
+	}
+	os.Exit(0)
+}
+
+func TestKernelProof(t *testing.T) {
+	if os.Getenv("NS_OWNERBPF_PROOF") != "1" || os.Geteuid() != 0 {
+		t.Fatal("unmet: run the reviewed hosted proof as root in a private network namespace")
+	}
+	self, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := os.Readlink("/proc/1/ns/net")
+	if err != nil || self == host {
+		t.Fatal("unmet: private network namespace required", err)
+	}
+	object := os.Getenv("NS_OWNERBPF_OBJECT")
+	if object == "" {
+		t.Fatal("unmet: generated object path required")
+	}
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("actual kernel=%s architecture=%s; backend=bpf-proof-v1; notification reader=absent", unix.ByteSliceToString(uts.Release[:]), unix.ByteSliceToString(uts.Machine[:]))
+	if required := os.Getenv("NS_OWNERBPF_KERNEL"); required != "" && unix.ByteSliceToString(uts.Release[:]) != required {
+		t.Fatalf("unmet floor: actual kernel differs from required %s", required)
+	}
+	// Retain the original membership so cleanup doesn't remove an occupied cgroup.
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original string
+	for _, line := range bytes.Split(b, []byte{'\n'}) {
+		if bytes.HasPrefix(line, []byte("0::")) {
+			original = filepath.Join("/sys/fs/cgroup", string(line[3:]))
+		}
+	}
+	if original == "" {
+		t.Fatal("unmet: cgroup v2 membership missing")
+	}
+	dir, err := os.MkdirTemp("/sys/fs/cgroup", "ns-owner-proof-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.WriteFile(filepath.Join(original, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+			t.Error(err)
+		}
+		if err := os.Remove(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: 32 << 20, Max: 32 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(object, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	lo, err := netlink.LinkByName("lo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.LinkSetUp(lo); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("creator-idle-holder-sender-exec-exit", func(t *testing.T) {
+		receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer receiver.Close()
+		sender, err := net.DialUDP("udp4", nil, receiver.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sender.Close()
+		f, err := sender.File()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		cookie, err := unix.GetsockoptUint64(int(f.Fd()), unix.SOL_SOCKET, unix.SO_COOKIE)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		exe, _ := os.Executable()
+		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestProofChild$")
+		cmd.ExtraFiles = []*os.File{f}
+		cmd.Env = append(os.Environ(), "NS_OWNER_CHILD=exec")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill() })
+		pid := uint32(cmd.Process.Pid)
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d/exe", pid)); !os.IsNotExist(err) {
+			t.Fatalf("exit precondition: %v", err)
+		}
+		var key ActorKey
+		var evidence ActorEvidence
+		var generations []ActorKey
+		iter := p.Collection.Maps["actors"].Iterate()
+		for iter.Next(&key, &evidence) {
+			if key.Cookie != cookie {
+				continue
+			}
+			if key.TGID != pid || evidence.ABI != ABI || evidence.Inode == 0 || key.Start == 0 {
+				t.Fatalf("wrong actor evidence: %+v %+v", key, evidence)
+			}
+			generations = append(generations, key)
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if len(generations) != 2 || generations[0].Exec == generations[1].Exec || generations[0].Start != generations[1].Start {
+			t.Fatalf("exec history not retained: %+v", generations)
+		}
+		for range 2 {
+			_ = receiver.SetReadDeadline(time.Now().Add(time.Second))
+			b := make([]byte, 64)
+			if n, _, err := receiver.ReadFromUDP(b); err != nil || string(b[:n]) != "same-datagram" {
+				t.Fatalf("accepted data missing: %d %v", n, err)
+			}
+		}
+		counts, err := p.Counts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := Decide(context.Background(), time.Now(), counts, &TupleEvidence{FirstCookie: cookie})
+		if r.Status != IncompleteIdentity || r.AllowsScanner() {
+			t.Fatal(r)
+		}
+		t.Log("sender-to-cookie and retained exec evidence present; complete app identities=0/2 (UNMET, not PID hits)")
+	})
+	t.Run("queued-tuple-reuse", func(t *testing.T) { queuedReuse(t, p) })
+	t.Run("concurrent-same-executable-senders", func(t *testing.T) {
+		receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer receiver.Close()
+		sender, err := net.DialUDP("udp4", nil, receiver.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sender.Close()
+		f, err := sender.File()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		cookie, err := unix.GetsockoptUint64(int(f.Fd()), unix.SOL_SOCKET, unix.SO_COOKIE)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		exe, _ := os.Executable()
+		var commands []*exec.Cmd
+		pids := map[uint32]bool{}
+		gateRead, gateWrite, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gateRead.Close()
+		defer gateWrite.Close()
+		for range 2 {
+			cmd := exec.CommandContext(ctx, exe, "-test.run=^TestProofChild$")
+			cmd.ExtraFiles = []*os.File{f, gateRead}
+			cmd.Env = append(os.Environ(), "NS_OWNER_CHILD=barrier")
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+			commands = append(commands, cmd)
+			pids[uint32(cmd.Process.Pid)] = true
+		}
+		// Both children exist before the shared EOF releases either sender.
+		if err := gateWrite.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for _, cmd := range commands {
+			if err := cmd.Wait(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var key ActorKey
+		var value ActorEvidence
+		it := p.Collection.Maps["actors"].Iterate()
+		seen := map[uint32]bool{}
+		for it.Next(&key, &value) {
+			if key.Cookie == cookie {
+				if !pids[key.TGID] {
+					t.Fatalf("creator/idle holder substituted for sender: %+v", key)
+				}
+				seen[key.TGID] = true
+			}
+		}
+		if err := it.Err(); err != nil || len(seen) != 2 {
+			t.Fatalf("concurrent evidence lost: %v %v", seen, err)
+		}
+		for range 2 {
+			_ = receiver.SetReadDeadline(time.Now().Add(time.Second))
+			b := make([]byte, 64)
+			if n, _, err := receiver.ReadFromUDP(b); err != nil || string(b[:n]) != "same-datagram" {
+				t.Fatalf("sender data missing: %d %v", n, err)
+			}
+		}
+		t.Log("two processes of the same executable retained independently; app-equivalence/conflicting-app decision remains UNMET")
+	})
+	t.Run("failed-first-send-is-only-an-attempt", func(t *testing.T) {
+		s, err := net.Dial("udp4", "127.0.0.1:9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		before, err := p.Counts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Write(make([]byte, 65536)); err == nil {
+			t.Fatal("oversized datagram unexpectedly accepted")
+		}
+		after, err := p.Counts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Attempts != before.Attempts+1 || after.Packets != before.Packets {
+			t.Fatalf("attempt/packet separation: before=%+v after=%+v", before, after)
+		}
+		t.Log("failed first send recorded only as attempt; no owner claim or egress record")
+	})
+	t.Run("sigkill-and-coexistence", func(t *testing.T) { crashCleanup(t, p, dir) })
+	t.Run("partial-load-unwind", func(t *testing.T) {
+		for _, stage := range []string{"initialize_cookie", "observe_packet", "pmu"} {
+			t.Run(stage, func(t *testing.T) {
+				injected := errors.New("fixture attachment failure")
+				var ids attachmentIDs
+				got, err := load(object, dir, func(at string, partial *Probe) error {
+					if at != stage {
+						return nil
+					}
+					for _, l := range partial.links {
+						info, e := l.Info()
+						if e != nil {
+							return e
+						}
+						ids.Links = append(ids.Links, info.ID)
+					}
+					for _, prog := range partial.Collection.Programs {
+						info, e := prog.Info()
+						if e != nil {
+							return e
+						}
+						id, ok := info.ID()
+						if !ok {
+							return errors.New("program ID missing")
+						}
+						ids.Programs = append(ids.Programs, id)
+					}
+					return injected
+				})
+				if got != nil {
+					_ = got.Close()
+					t.Fatal("partial load unexpectedly succeeded")
+				}
+				if !errors.Is(err, injected) || len(ids.Links) == 0 || len(ids.Programs) != 3 {
+					t.Fatalf("partial attachment precondition not reached: %+v %v", ids, err)
+				}
+				assertAttachmentsGone(t, ids)
+			})
+		}
+	})
+	t.Run("bounded-map-exhaustion", func(t *testing.T) {
+		// Accumulated state from previous fixtures is deliberately retained.
+		m := p.Collection.Maps["actors"]
+		for i := uint64(1); i <= RecordLimit; i++ {
+			if err := m.Update(ActorKey{Cookie: i, Start: 1}, ActorEvidence{ABI: ABI}, ebpf.UpdateNoExist); err != nil {
+				break
+			}
+		}
+		var k ActorKey
+		var v ActorEvidence
+		it, n := m.Iterate(), 0
+		for it.Next(&k, &v) {
+			n++
+		}
+		if err := it.Err(); err != nil || n != RecordLimit {
+			t.Fatalf("full precondition: n=%d err=%v", n, err)
+		}
+		s, err := net.Dial("udp4", "127.0.0.1:9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		_, _ = s.Write([]byte("pressure"))
+		counts, err := p.Counts()
+		if err != nil || counts.InsertFailure == 0 || counts.Poison == 0 {
+			t.Fatalf("overflow not latched: %+v %v", counts, err)
+		}
+		if r := Decide(context.Background(), time.Now(), counts, &TupleEvidence{FirstCookie: 1}); r.Status != Poisoned || r.AllowsScanner() {
+			t.Fatal(r)
+		}
+		t.Logf("bounded actor slots=%d counters=%+v; no reclamation/TTL; poisoned until collection destroyed", n, counts)
+	})
+}
+
+type attachmentIDs struct {
+	Links    []link.ID
+	Programs []ebpf.ProgramID
+}
+
+func crashCleanup(t *testing.T, existing *Probe, cgroup string) {
+	exe, _ := os.Executable()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestProofChild$")
+	cmd.Env = append(os.Environ(), "NS_OWNER_CHILD=loader", "NS_OWNER_CGROUP="+cgroup)
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	var ids attachmentIDs
+	if err := json.NewDecoder(stdout).Decode(&ids); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids.Links) != 2 || len(ids.Programs) != 3 {
+		t.Fatalf("attachments absent before kill: %+v", ids)
+	}
+	for _, id := range ids.Links {
+		l, err := link.NewFromID(id)
+		if err != nil {
+			t.Fatalf("live link %d absent: %v", id, err)
+		}
+		_ = l.Close()
+	}
+	for _, id := range ids.Programs {
+		prog, err := ebpf.NewProgramFromID(id)
+		if err != nil {
+			t.Fatalf("live program %d absent: %v", id, err)
+		}
+		_ = prog.Close()
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("child wasn't killed")
+	}
+	assertAttachmentsGone(t, ids)
+	for _, l := range existing.links {
+		if _, err := l.Info(); err != nil {
+			t.Fatalf("coexisting link was removed: %v", err)
+		}
+	}
+	t.Log("child links and PMU-held programs existed before SIGKILL, disappeared after it; parent's links survived")
+}
+
+func assertAttachmentsGone(t *testing.T, ids attachmentIDs) {
+	t.Helper()
+	// Kernel RCU disposal can lag FD closure. Bounded cleanup observation is
+	// not a retry of an attribution miss; assert all resources existed first.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		alive := false
+		for _, id := range ids.Links {
+			l, err := link.NewFromID(id)
+			if err == nil {
+				alive = true
+				_ = l.Close()
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+		for _, id := range ids.Programs {
+			prog, err := ebpf.NewProgramFromID(id)
+			if err == nil {
+				alive = true
+				_ = prog.Close()
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owned attachments/programs survived SIGKILL: %+v", ids)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func queuedReuse(t *testing.T, p *Probe) {
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	ifr, err := unix.NewIfreq("nsproof0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_TUN_EXCL)
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		t.Fatal(err)
+	}
+	l, err := netlink.LinkByName("nsproof0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := netlink.ParseAddr("198.18.0.1/24")
+	if err := netlink.AddrAdd(l, addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.LinkSetUp(l); err != nil {
+		t.Fatal(err)
+	}
+	port := 0
+	cookies := [2]uint64{}
+	for i := range 2 {
+		s, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			defer unix.Close(s)
+			if err := unix.Bind(s, &unix.SockaddrInet4{Addr: [4]byte{198, 18, 0, 1}, Port: port}); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Connect(s, &unix.SockaddrInet4{Addr: [4]byte{198, 18, 0, 2}, Port: 9000}); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.SetsockoptInt(s, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO); err != nil {
+				t.Fatal(err)
+			}
+			bound, err := unix.Getsockname(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port = bound.(*unix.SockaddrInet4).Port
+			cookies[i], err = unix.GetsockoptUint64(s, unix.SOL_SOCKET, unix.SO_COOKIE)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := unix.Write(s, []byte("identical")); err != nil {
+				t.Fatal(err)
+			}
+		}()
+	}
+	if cookies[0] == cookies[1] || cookies[0] == 0 {
+		t.Fatal("distinct socket generation precondition", cookies)
+	}
+	key := TupleKey{Source: [4]byte{198, 18, 0, 1}, Destination: [4]byte{198, 18, 0, 2}, Ports: [4]byte{byte(port >> 8), byte(port), 0x23, 0x28}}
+	var tuple TupleEvidence
+	if err := p.Collection.Maps["tuples"].Lookup(key, &tuple); err != nil {
+		t.Fatal(err)
+	}
+	if tuple.FirstCookie != cookies[0] || tuple.Conflicts == 0 {
+		t.Fatalf("overlap not retained before any TUN read: %+v cookies=%v", tuple, cookies)
+	}
+	var packets [2][]byte
+	for i := range packets {
+		poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		if n, err := unix.Poll(poll, 1000); err != nil || n != 1 {
+			t.Fatalf("queued packet missing: %d %v", n, err)
+		}
+		b := make([]byte, 2048)
+		n, err := unix.Read(fd, b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets[i] = b[:n]
+	}
+	if !bytes.Equal(packets[0], packets[1]) {
+		t.Fatalf("identical-packet precondition failed:\n%x\n%x", packets[0], packets[1])
+	}
+	t.Logf("counterexample: cookies=%v, identical queued packets=%x, tuple=%+v; latest-cookie would misattribute packet 1", cookies, packets[0], tuple)
+}
