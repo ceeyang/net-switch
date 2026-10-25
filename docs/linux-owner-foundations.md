@@ -6,11 +6,11 @@ one-second reconciliation and both forwarding paths unchanged.
 
 | Obligation | This change | Evidence now |
 | --- | --- | --- |
-| Original ABI and probes | Cookie initialization, IPv4 UDP attempt evidence, IPv4 packet tuple collision latch | Source only; ELF generation and verifier acceptance pending |
-| Owned loader | Direct cgroup links and per-online-CPU PMU FDs; no tracefs/legacy fallback or pins | Linux x64/arm64 cross-compilation; Linux x64 vet passed |
+| Original ABI and probes | Cookie initialization, IPv4 UDP attempt evidence, IPv4 packet tuple collision latch | Pilot e112: generation twice byte-identical; loaded on modern x64/arm64 |
+| Owned loader | Direct cgroup links and one PMU FD; no tracefs/legacy fallback or pins | Pilot exposed duplicate callbacks; corrected attachment awaits next kernel run |
 | Safety decision | No known-owner result; ambiguity/poison/incomplete identity cannot fall back | Four pure tests passed on Windows |
-| Connected UDP actor, exit/exec | Inherited connected FD; two exec generations retained after exit | Hosted fixture written, not run |
-| Queued tuple reuse | Two sockets, same port and bytes, both packets queued before any TUN read | Source-backed counterexample; real-kernel fixture not run |
+| Connected UDP actor, exit/exec | Inherited connected FD; two exec generations retained after exit | Pilot e112 retained evidence on both architectures; complete identity still 0/2 |
+| Queued tuple reuse | Two sockets, same port and bytes, both packets queued before any TUN read | ARM64 pilot passed; x64 encountered an IPv6 router solicitation; IPv4-only fixture fix awaits rerun |
 | Linux 5.8, both architectures | No guest infrastructure found in existing workflows/scripts | **Unmet**; modern namespaces do not qualify the floor |
 | Complete identity | PID/start/exec/device/inode evidence is deliberately insufficient | **Unmet**, complete identity numerator remains zero |
 
@@ -18,6 +18,36 @@ First review follow-up: all 106 CI tooling tests passed (zero skips), including
 the owner-proof dispatch exclusivity and action-pin guards. Four pure Go tests,
 tagged Linux amd64/arm64 cross-compilation and Linux amd64 vet also passed.
 These checks did not run the Linux fixtures or dispatch the hosted pilot.
+
+## First hosted pilot and diagnostic fixes
+
+[Run 40182049682](https://github.com/kekawia/net-switch/actions/runs/40182049682)
+used e112b1929c75957301b587c66b594d4877b010c2 on kernel 6.17.0-1022-azure,
+x86_64 and aarch64. The parent-dispatched builder succeeded with two-pass
+byte equality. ARM64 demonstrated cookies 4097/4098 and identical queued
+packets while B remained live. Both jobs still failed; this is not qualification.
+
+- One oversized send advanced Attempts from 24 to 28, with Packets unchanged
+  at 6. The loader created one local kprobe per online CPU. Linux 5.8 and 6.17
+  run the BPF program before checking the per-CPU perf-event list, so these
+  were four real callbacks, not a counter-format issue. The fix owns one PMU
+  FD with pid=-1/cpu=0, matching the pinned loader's mechanism. Counts remain
+  exact. A new bounded fixture pins a thread to each online CPU, checks its
+  actual CPU around the send, requires exactly one attempt/packet and validates
+  received bytes. Missing CPU access or a changed online set fails coverage.
+- Cleanup reached wrapped ENOENT after proving the objects existed. The
+  SDK wraps both ID lookup errors with `%w`; `os.IsNotExist` missed that chain.
+  The cleanup check now uses `errors.Is(err, unix.ENOENT)`. Every other error
+  still fails, and the fresh coexisting traffic proof remains required.
+- x64 received an IPv6 router solicitation before the expected packets. Only
+  the new private TUN's `disable_ipv6` is set and read back before bringing it
+  up. No host/default sysctl changes or packet-discard loop are used.
+
+These diagnostic fixes preserve the parent's `ns_owner_license` rename and
+ELF license section. They are not credited as kernel passes until rerun.
+Local validation of the fixes: four pure tests passed, the complete tagged
+fixture cross-compiled for Linux amd64/arm64, and Linux amd64 vet passed. No
+Linux execution, pilot dispatch or CI watcher was started by the worker.
 
 ## Must resolve before integration
 
@@ -86,23 +116,28 @@ It does not execute on Windows. The host's libc/runtime is still a builder
 prerequisite, not a pinned complete container image.
 
 **Generated objects under gitignored `dist/ownerbpf` are proof artifacts only.**
-They are not yet verified or committed, and there is no embedded production
+The e112 pilot generated reproducible objects and loaded them on both modern
+architectures; they remain uncommitted proof artifacts with no embedded production
 object. The future tracked production destination is
 `internal/engine/linux/ownerbpf/generated/`. Producing objects there and adding
 a CI regeneration-versus-committed-output diff check remain explicitly pending
 before integration; neither is implemented by this proof-artifact generator.
-This draft does not claim that the source has passed clang or a verifier.
+Modern verifier acceptance does not establish the Linux 5.8 floor.
 
 The loader requests the actual three programs/maps/helper combinations. It
 uses `AttachRawLink`, not the high-level cgroup fallback. Kprobes use the PMU
-`perf_event_open` ABI directly, one event per online CPU, at most 512 CPUs.
+`perf_event_open` ABI directly, one system-wide event (pid=-1/cpu=0).
+The CPU coverage fixture is bounded to 512 CPUs and ten seconds, reusing one
+socket so its actor/tuple occupancy does not grow with CPU count. The loader
+owns one PMU FD and two cgroup link FDs per collection; partial-load and crash
+fixtures assert that PMU ownership count as well as actual object pre-existence.
 Every acquired FD is owned and unwound in reverse order on errors. No other
 application's attachment is replaced or detached. The opt-in crash fixture
 first proves its links/programs exist, kills the owner, checks their removal,
 and proves the original collection still observes a fresh datagram with checked
 payload/source and advancing Attempts/Packets, while the child's objects remain
-gone. Partial-attachment unwinding
-is implemented but has not yet been fault-injected on a kernel.
+gone. Partial-attachment faults ran in the pilot but their absence checks failed
+on the wrapped ENOENT bug; corrected cleanup evidence remains pending.
 
 Maps have 256 immutable actor records (32-byte key, 32-byte value), 256 tuple
 records (12-byte key, 16-byte value), seven 64-bit counters and one 64-bit scope
@@ -132,10 +167,12 @@ kernel fixtures, a 60-second fixture timeout and no acceptance/stress dispatch.
 Its final qualification job deliberately fails on the known unmet obligations.
 
 ```sh
-gh workflow run native-service-contracts.yml --repo kekawia/net-switch --ref t3/linux-ebpf-attribution-foundations -f owner_proof=true
+gh workflow run native-service-contracts.yml --repo kekawia/net-switch --ref diagnostic/linux-owner-pilot -f owner_proof=true
 ```
 
-The worker does not dispatch or watch it. On the hosted builder, the exact
+Diagnostic fixes are pushed only to `diagnostic/linux-owner-pilot`; the parent
+promotes the reviewed final head to PR100. The worker does not dispatch or watch
+the pilot. On the hosted builder, the exact
 generation command is `node scripts/generate-owner-bpf.mjs`. Each modern runner
 builds the tagged fixture and runs it in `unshare --net`; no engine or service
 is started. Actual 5.8 guests need a separate reviewed infrastructure plan.
@@ -147,6 +184,13 @@ fault-inject partial attachment, measure allocations/overhead, and run actual
 5.8 x64/arm64. Do not treat this draft's cross-compilation as those results.
 
 ## Source decisions checked
+
+- [Linux 5.8 kprobe BPF ordering](https://github.com/torvalds/linux/blob/v5.8/kernel/trace/trace_kprobe.c),
+  [Linux 6.17 ordering](https://github.com/torvalds/linux/blob/v6.17/kernel/trace/trace_kprobe.c)
+  and [PMU event creation](https://github.com/torvalds/linux/blob/v6.17/kernel/trace/trace_event_perf.c):
+  each PMU event creates a local probe; `trace_call_bpf` runs before the per-CPU
+  perf-event list is checked. The single-FD setup follows
+  [cilium v0.22.0 pmuProbe](https://github.com/cilium/ebpf/blob/v0.22.0/link/kprobe.go).
 
 - [Linux 5.8 IP-ID selection](https://github.com/torvalds/linux/blob/v5.8/include/net/ip.h)
   and [Linux 6.12 IP-ID selection](https://github.com/torvalds/linux/blob/v6.12/include/net/ip.h):

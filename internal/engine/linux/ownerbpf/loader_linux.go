@@ -150,33 +150,28 @@ func (p *Probe) attachPMU(program *ebpf.Program, symbol string) error {
 	if err != nil {
 		return fmt.Errorf("kprobe PMU type: %w", err)
 	}
-	b, err = os.ReadFile("/sys/devices/system/cpu/online")
-	if err != nil {
-		return err
-	}
-	cpus, err := onlineCPUs(strings.TrimSpace(string(b)))
-	if err != nil {
-		return err
-	}
 	name, err := unix.BytePtrFromString(symbol)
 	if err != nil {
 		return err
 	}
-	for _, cpu := range cpus {
-		attr := unix.PerfEventAttr{Type: uint32(kind), Size: unix.PERF_ATTR_SIZE_VER1,
-			Bits: unix.PerfBitDisabled, Ext1: uint64(uintptr(unsafe.Pointer(name)))}
-		fd, e := unix.PerfEventOpen(&attr, -1, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
-		runtime.KeepAlive(name)
-		if e != nil {
-			return fmt.Errorf("perf_event_open PMU %s cpu=%d: %w", symbol, cpu, e)
-		}
-		p.perf = append(p.perf, fd)
-		if e = unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, program.FD()); e != nil {
-			return fmt.Errorf("PERF_EVENT_IOC_SET_BPF %s cpu=%d: %w", symbol, cpu, e)
-		}
-		if e = unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); e != nil {
-			return fmt.Errorf("PERF_EVENT_IOC_ENABLE %s cpu=%d: %w", symbol, cpu, e)
-		}
+	// One PMU event creates one local trace kprobe. In 5.8 and 6.17,
+	// kprobe_perf_func runs trace_call_bpf BEFORE the per-CPU perf event list
+	// check. Opening one event per CPU therefore duplicates BPF execution
+	// globally; cpu=0 is not a BPF execution filter. Match cilium v0.22.0's
+	// single system-wide PMU event (pid=-1, cpu=0), without its fallback.
+	attr := unix.PerfEventAttr{Type: uint32(kind), Size: unix.PERF_ATTR_SIZE_VER1,
+		Bits: unix.PerfBitDisabled, Ext1: uint64(uintptr(unsafe.Pointer(name)))}
+	fd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	runtime.KeepAlive(name)
+	if err != nil {
+		return fmt.Errorf("perf_event_open PMU %s cpu=0: %w", symbol, err)
+	}
+	p.perf = append(p.perf, fd)
+	if err = unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_SET_BPF, program.FD()); err != nil {
+		return fmt.Errorf("PERF_EVENT_IOC_SET_BPF %s: %w", symbol, err)
+	}
+	if err = unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
+		return fmt.Errorf("PERF_EVENT_IOC_ENABLE %s: %w", symbol, err)
 	}
 	return nil
 }

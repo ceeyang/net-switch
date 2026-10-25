@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -37,7 +39,7 @@ func TestProofChild(t *testing.T) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(73)
 		}
-		var ids attachmentIDs
+		ids := attachmentIDs{PerfFDs: len(p.perf)}
 		for _, l := range p.links {
 			info, err := l.Info()
 			if err != nil {
@@ -329,6 +331,7 @@ func TestKernelProof(t *testing.T) {
 		}
 		t.Log("failed first send recorded only as attempt; no owner claim or egress record")
 	})
+	t.Run("one-callback-per-online-cpu", func(t *testing.T) { callbackEveryCPU(t, p) })
 	t.Run("sigkill-and-coexistence", func(t *testing.T) { crashCleanup(t, p, dir) })
 	t.Run("partial-load-unwind", func(t *testing.T) {
 		for _, stage := range []string{"initialize_cookie", "observe_packet", "pmu"} {
@@ -338,6 +341,13 @@ func TestKernelProof(t *testing.T) {
 				got, err := load(object, dir, func(at string, partial *Probe) error {
 					if at != stage {
 						return nil
+					}
+					wantPerf := 0
+					if at == "pmu" {
+						wantPerf = 1
+					}
+					if len(partial.perf) != wantPerf {
+						return fmt.Errorf("partial PMU ownership: got %d want %d", len(partial.perf), wantPerf)
 					}
 					for _, l := range partial.links {
 						info, e := l.Info()
@@ -407,6 +417,7 @@ func TestKernelProof(t *testing.T) {
 type attachmentIDs struct {
 	Links    []link.ID
 	Programs []ebpf.ProgramID
+	PerfFDs  int
 }
 
 func crashCleanup(t *testing.T, existing *Probe, cgroup string) {
@@ -428,7 +439,7 @@ func crashCleanup(t *testing.T, existing *Probe, cgroup string) {
 	if err := json.NewDecoder(stdout).Decode(&ids); err != nil {
 		t.Fatal(err)
 	}
-	if len(ids.Links) != 2 || len(ids.Programs) != 3 {
+	if len(ids.Links) != 2 || len(ids.Programs) != 3 || ids.PerfFDs != 1 {
 		t.Fatalf("attachments absent before kill: %+v", ids)
 	}
 	for _, id := range ids.Links {
@@ -505,7 +516,7 @@ func assertAttachmentsGone(t *testing.T, ids attachmentIDs) {
 			if err == nil {
 				alive = true
 				_ = l.Close()
-			} else if !os.IsNotExist(err) {
+			} else if !errors.Is(err, unix.ENOENT) {
 				t.Fatal(err)
 			}
 		}
@@ -514,7 +525,7 @@ func assertAttachmentsGone(t *testing.T, ids attachmentIDs) {
 			if err == nil {
 				alive = true
 				_ = prog.Close()
-			} else if !os.IsNotExist(err) {
+			} else if !errors.Is(err, unix.ENOENT) {
 				t.Fatal(err)
 			}
 		}
@@ -545,6 +556,16 @@ func queuedReuse(t *testing.T, p *Probe) {
 	l, err := netlink.LinkByName("nsproof0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Only this newly created, still-down interface in the private netns.
+	// Prevent IPv6 router solicitations; do not drain unrelated frames until
+	// the expected IPv4 packets happen to appear.
+	ipv6 := "/proc/sys/net/ipv6/conf/nsproof0/disable_ipv6"
+	if err := os.WriteFile(ipv6, []byte("1"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := os.ReadFile(ipv6); err != nil || strings.TrimSpace(string(value)) != "1" {
+		t.Fatalf("private TUN IPv4-only precondition: value=%q err=%v", value, err)
 	}
 	addr, _ := netlink.ParseAddr("198.18.0.1/24")
 	if err := netlink.AddrAdd(l, addr); err != nil {
@@ -646,4 +667,100 @@ func queuedReuse(t *testing.T, p *Probe) {
 		t.Fatalf("identical-packet precondition failed:\n%x\n%x", packets[0], packets[1])
 	}
 	t.Logf("counterexample: cookies=%v, identical queued packets=%x, tuple=%+v; latest-cookie would misattribute packet 1", cookies, packets[0], tuple)
+}
+
+func callbackEveryCPU(t *testing.T, p *Probe) {
+	if len(p.perf) != 1 {
+		t.Fatalf("expected one owned PMU FD, got %d", len(p.perf))
+	}
+	online, err := os.ReadFile("/sys/devices/system/cpu/online")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpus, err := onlineCPUs(strings.TrimSpace(string(online)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := net.DialUDP("udp4", nil, receiver.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	f, err := sender.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// One socket/process keeps map occupancy constant even on a large host.
+	// Affinity and getcpu bracket the synchronous send on the locked OS thread.
+	runtime.LockOSThread()
+	var original unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &original); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := unix.SchedSetaffinity(0, &original); err != nil {
+			t.Errorf("restore original CPU affinity: %v", err)
+			// Do not return a restricted thread to the runtime's thread pool.
+			return
+		}
+		runtime.UnlockOSThread()
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for _, cpu := range cpus {
+		if !original.IsSet(cpu) {
+			t.Fatalf("unmet CPU coverage: online CPU %d is outside original affinity", cpu)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("per-CPU callback proof exceeded 10-second budget")
+		}
+		var mask unix.CPUSet
+		mask.Set(cpu)
+		if err := unix.SchedSetaffinity(0, &mask); err != nil {
+			t.Fatal(err)
+		}
+		checkCPU := func() {
+			var actual uint32
+			_, _, errno := unix.RawSyscall(unix.SYS_GETCPU, uintptr(unsafe.Pointer(&actual)), 0, 0)
+			if errno != 0 || int(actual) != cpu {
+				t.Fatalf("CPU execution precondition: got=%d want=%d errno=%v", actual, cpu, errno)
+			}
+		}
+		before, err := p.Counts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte(fmt.Sprintf("callback-on-cpu-%d", cpu))
+		checkCPU()
+		if n, err := unix.Write(int(f.Fd()), payload); err != nil || n != len(payload) {
+			t.Fatalf("CPU %d send: %d %v", cpu, n, err)
+		}
+		checkCPU()
+		after, err := p.Counts()
+		if err != nil || after.Attempts != before.Attempts+1 || after.Packets != before.Packets+1 {
+			t.Fatalf("CPU %d callback multiplicity: before=%+v after=%+v err=%v", cpu, before, after, err)
+		}
+		readDeadline := time.Now().Add(time.Second)
+		if deadline.Before(readDeadline) {
+			readDeadline = deadline
+		}
+		if err := receiver.SetReadDeadline(readDeadline); err != nil {
+			t.Fatal(err)
+		}
+		data := make([]byte, 128)
+		n, from, err := receiver.ReadFromUDP(data)
+		if err != nil || !bytes.Equal(data[:n], payload) || from.String() != sender.LocalAddr().String() {
+			t.Fatalf("CPU %d datagram mismatch: bytes=%q source=%v err=%v", cpu, data[:n], from, err)
+		}
+		t.Logf("cpu=%d attempts_delta=1 packets_delta=1 received=%q", cpu, data[:n])
+	}
+	if now, err := os.ReadFile("/sys/devices/system/cpu/online"); err != nil || !bytes.Equal(now, online) {
+		t.Fatalf("online CPU set changed during proof: before=%q after=%q err=%v", online, now, err)
+	}
 }
