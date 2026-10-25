@@ -14,6 +14,11 @@ one-second reconciliation and both forwarding paths unchanged.
 | Linux 5.8, both architectures | No guest infrastructure found in existing workflows/scripts | **Unmet**; modern namespaces do not qualify the floor |
 | Complete identity | PID/start/exec/device/inode evidence is deliberately insufficient | **Unmet**, complete identity numerator remains zero |
 
+First review follow-up: all 106 CI tooling tests passed (zero skips), including
+the owner-proof dispatch exclusivity and action-pin guards. Four pure Go tests,
+tagged Linux amd64/arm64 cross-compilation and Linux amd64 vet also passed.
+These checks did not run the Linux fixtures or dispatch the hosted pilot.
+
 ## Must resolve before integration
 
 **The tuple bridge loses packet generation.**
@@ -36,8 +41,11 @@ drain/acknowledgement boundary or a capture interface that delivers a generation
 token together with each packet. That is a design change, not another tuple TTL.
 Dependent Owners/forwarding integration stops here.
 
-The kernel fixture demands two distinct SO_COOKIE values and byte-identical
-packets, reads the collision before draining either packet, then reads both.
+The kernel fixture uses bound, unconnected UDP sockets with DF and Sendto.
+It proves A is closed before reusing its port, retains B through both TUN reads,
+and checks B's SO_COOKIE before and after draining. It demands distinct cookies,
+the exact tuple, DF/zero IP ID, payload and byte-identical captured packets;
+it reads the collision before draining either packet. No captured byte is edited.
 A failure of any precondition fails the fixture. The pure model is not credited
 as a successful real-kernel reproduction.
 
@@ -77,10 +85,12 @@ It builds both architecture-specific objects twice and compares every output.
 It does not execute on Windows. The host's libc/runtime is still a builder
 prerequisite, not a pinned complete container image.
 
-**Generated artifacts are not yet committed or verified.** There is no embedded
-production object. The manual workflow produces review artifacts; after a
-reviewed successful builder run, generated outputs must be committed and CI
-must compare regeneration against those committed outputs before integration.
+**Generated objects under gitignored `dist/ownerbpf` are proof artifacts only.**
+They are not yet verified or committed, and there is no embedded production
+object. The future tracked production destination is
+`internal/engine/linux/ownerbpf/generated/`. Producing objects there and adding
+a CI regeneration-versus-committed-output diff check remain explicitly pending
+before integration; neither is implemented by this proof-artifact generator.
 This draft does not claim that the source has passed clang or a verifier.
 
 The loader requests the actual three programs/maps/helper combinations. It
@@ -89,7 +99,9 @@ uses `AttachRawLink`, not the high-level cgroup fallback. Kprobes use the PMU
 Every acquired FD is owned and unwound in reverse order on errors. No other
 application's attachment is replaced or detached. The opt-in crash fixture
 first proves its links/programs exist, kills the owner, checks their removal,
-and checks that a coexisting collection survives. Partial-attachment unwinding
+and proves the original collection still observes a fresh datagram with checked
+payload/source and advancing Attempts/Packets, while the child's objects remain
+gone. Partial-attachment unwinding
 is implemented but has not yet been fault-injected on a kernel.
 
 Maps have 256 immutable actor records (32-byte key, 32-byte value), 256 tuple
@@ -112,12 +124,15 @@ unimplemented or unproven. No release blocker is removed.
 
 ## Parent's next commands
 
-Review the manual workflow first. It has four jobs total, only two concurrent
+Review the reusable workflow first. Its registered entry point is
+`native-service-contracts.yml` with `owner_proof=true`; that selection excludes
+the ordinary five-runner native matrix. PR/push/default dispatch behavior stays
+unchanged. The proof has four jobs total, only two concurrent
 kernel fixtures, a 60-second fixture timeout and no acceptance/stress dispatch.
 Its final qualification job deliberately fails on the known unmet obligations.
 
 ```sh
-gh workflow run linux-owner-proof.yml --repo kekawia/net-switch --ref t3/linux-ebpf-attribution-foundations
+gh workflow run native-service-contracts.yml --repo kekawia/net-switch --ref t3/linux-ebpf-attribution-foundations -f owner_proof=true
 ```
 
 The worker does not dispatch or watch it. On the hosted builder, the exact
@@ -132,6 +147,11 @@ fault-inject partial attachment, measure allocations/overhead, and run actual
 5.8 x64/arm64. Do not treat this draft's cross-compilation as those results.
 
 ## Source decisions checked
+
+- [Linux 5.8 IP-ID selection](https://github.com/torvalds/linux/blob/v5.8/include/net/ip.h)
+  and [Linux 6.12 IP-ID selection](https://github.com/torvalds/linux/blob/v6.12/include/net/ip.h):
+  connected sockets use a per-socket ID even with DF. The unconnected DF branch
+  sets ID zero, allowing real byte equality without altering captured data.
 
 - [Linux 5.8 UDP](https://github.com/torvalds/linux/blob/v5.8/net/ipv4/udp.c):
   the cgroup sendmsg hook excludes connected sends; pending sendpage bypasses

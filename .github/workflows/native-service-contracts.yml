@@ -8,6 +8,10 @@ on:
     paths: ['internal/**', 'cmd/**', 'tests/lifecycle/**', 'tests/linux/**', 'tests/windows/**', 'scripts/build-common.ps1', 'scripts/run-native-proof.mjs', 'packaging/versions.json', 'go.mod', 'go.sum', 'vendor/**', '.github/workflows/native-service-contracts.yml', '.github/ci/registrar-breakaway.mjs']
   workflow_dispatch:
     inputs:
+      owner_proof:
+        description: 'Run only the bounded Linux owner foundations pilot'
+        type: boolean
+        default: false
       runner:
         description: 'One runner for focused diagnostics; ordinary PRs use the full matrix'
         type: choice
@@ -26,7 +30,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  owner-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.owner_proof
+    uses: ./.github/workflows/linux-owner-proof.yml
   services:
+    if: github.event_name != 'workflow_dispatch' || !inputs.owner_proof
     name: Native services / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40

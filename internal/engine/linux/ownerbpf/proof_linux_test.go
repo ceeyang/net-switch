@@ -457,7 +457,40 @@ func crashCleanup(t *testing.T, existing *Probe, cgroup string) {
 			t.Fatalf("coexisting link was removed: %v", err)
 		}
 	}
-	t.Log("child links and PMU-held programs existed before SIGKILL, disappeared after it; parent's links survived")
+	// An open link FD alone doesn't prove that the surviving hooks still run.
+	// Use a fresh socket/tuple and check both actual data and its observations.
+	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := net.DialUDP("udp4", nil, receiver.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	payload := []byte(fmt.Sprintf("after-sigkill:%d:%s", cmd.Process.Pid, sender.LocalAddr()))
+	before, err := existing.Counts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := sender.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("fresh coexistence send: %d %v", n, err)
+	}
+	if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 256)
+	n, from, err := receiver.ReadFromUDP(data)
+	if err != nil || !bytes.Equal(data[:n], payload) || from.String() != sender.LocalAddr().String() {
+		t.Fatalf("fresh coexistence receive: bytes=%q source=%v err=%v", data[:n], from, err)
+	}
+	after, err := existing.Counts()
+	if err != nil || after.Attempts != before.Attempts+1 || after.Packets != before.Packets+1 {
+		t.Fatalf("surviving hooks not observed: before=%+v after=%+v err=%v", before, after, err)
+	}
+	assertAttachmentsGone(t, ids)
+	t.Log("child objects existed before SIGKILL and remain gone; original collection observed and delivered a fresh checked datagram")
 }
 
 func assertAttachmentsGone(t *testing.T, ids attachmentIDs) {
@@ -522,19 +555,31 @@ func queuedReuse(t *testing.T, p *Probe) {
 	}
 	port := 0
 	cookies := [2]uint64{}
+	second := -1
+	defer func() {
+		if second >= 0 {
+			_ = unix.Close(second)
+		}
+	}()
 	for i := range 2 {
 		s, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
 		func() {
-			defer unix.Close(s)
+			keep := false
+			defer func() {
+				if !keep {
+					if err := unix.Close(s); err != nil {
+						t.Error(err)
+					}
+				}
+			}()
 			if err := unix.Bind(s, &unix.SockaddrInet4{Addr: [4]byte{198, 18, 0, 1}, Port: port}); err != nil {
 				t.Fatal(err)
 			}
-			if err := unix.Connect(s, &unix.SockaddrInet4{Addr: [4]byte{198, 18, 0, 2}, Port: 9000}); err != nil {
-				t.Fatal(err)
-			}
+			// Keep inet_daddr zero: connected DF sockets use a per-socket IP
+			// ID in both 5.8 and modern kernels. Unconnected DF sends use ID 0.
 			if err := unix.SetsockoptInt(s, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO); err != nil {
 				t.Fatal(err)
 			}
@@ -547,12 +592,21 @@ func queuedReuse(t *testing.T, p *Probe) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := unix.Write(s, []byte("identical")); err != nil {
+			if err := unix.Sendto(s, []byte("identical"), 0, &unix.SockaddrInet4{Addr: [4]byte{198, 18, 0, 2}, Port: 9000}); err != nil {
 				t.Fatal(err)
 			}
+			if i == 1 {
+				second, keep = s, true
+			}
 		}()
+		if i == 0 {
+			// No intervening FD allocation: prove A was closed before B binds.
+			if _, err := unix.GetsockoptUint64(s, unix.SOL_SOCKET, unix.SO_COOKIE); !errors.Is(err, unix.EBADF) {
+				t.Fatalf("first socket wasn't closed: %v", err)
+			}
+		}
 	}
-	if cookies[0] == cookies[1] || cookies[0] == 0 {
+	if cookies[0] == cookies[1] || cookies[0] == 0 || cookies[1] == 0 {
 		t.Fatal("distinct socket generation precondition", cookies)
 	}
 	key := TupleKey{Source: [4]byte{198, 18, 0, 1}, Destination: [4]byte{198, 18, 0, 2}, Ports: [4]byte{byte(port >> 8), byte(port), 0x23, 0x28}}
@@ -563,6 +617,13 @@ func queuedReuse(t *testing.T, p *Probe) {
 	if tuple.FirstCookie != cookies[0] || tuple.Conflicts == 0 {
 		t.Fatalf("overlap not retained before any TUN read: %+v cookies=%v", tuple, cookies)
 	}
+	checkSecond := func() {
+		t.Helper()
+		if cookie, err := unix.GetsockoptUint64(second, unix.SOL_SOCKET, unix.SO_COOKIE); err != nil || cookie != cookies[1] {
+			t.Fatalf("second generation no longer live: cookie=%d want=%d err=%v", cookie, cookies[1], err)
+		}
+	}
+	checkSecond()
 	var packets [2][]byte
 	for i := range packets {
 		poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
@@ -575,7 +636,12 @@ func queuedReuse(t *testing.T, p *Probe) {
 			t.Fatal(err)
 		}
 		packets[i] = b[:n]
+		if n != 37 || b[0] != 0x45 || b[9] != 17 || b[6] != 0x40 || b[7] != 0 || b[4] != 0 || b[5] != 0 ||
+			!bytes.Equal(b[12:16], key.Source[:]) || !bytes.Equal(b[16:20], key.Destination[:]) || !bytes.Equal(b[20:24], key.Ports[:]) || string(b[28:n]) != "identical" {
+			t.Fatalf("queued packet tuple/DF/ID/payload precondition failed: %x", b[:n])
+		}
 	}
+	checkSecond()
 	if !bytes.Equal(packets[0], packets[1]) {
 		t.Fatalf("identical-packet precondition failed:\n%x\n%x", packets[0], packets[1])
 	}
