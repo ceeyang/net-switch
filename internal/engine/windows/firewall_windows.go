@@ -327,7 +327,11 @@ func inspectWFP(o *objects, kind string, fp journal.Fingerprint) (journal.Finger
 			return nil, false, err
 		}
 		defer wfpDLL.NewProc("FwpmFreeMemory0").Call(uintptr(unsafe.Pointer(&row)))
-		if row.Key != key || row.Flags != 1 || row.Provider != nil || row.Weight != 65535 ||
+		// Local compatibility patch: some security software (Huorong's
+		// hrwfpdrv) keeps the top sublayer weight for itself and lowers any
+		// other sublayer created at 65535. Weight only orders sublayers, so a
+		// lowered weight is not treated as tampering; every other field is.
+		if row.Key != key || row.Flags != 1 || row.Provider != nil ||
 			!matchingWFPMetadata(row.Display, row.Data, fp["owner"]) {
 			live["changed"] = "1"
 		}
