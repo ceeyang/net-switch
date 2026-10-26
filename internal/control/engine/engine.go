@@ -155,6 +155,15 @@ type Accounting interface {
 	AckTotals(ctx context.Context, opID, receipt string) error
 }
 
+// OwnerlessRouter is implemented by an engine that can say whether it routes
+// flows without an owning program (virtual machines, WSL, containers) by the
+// pin under apppath.Unknown. The native engine does; sing-box matches rules by
+// process path only, so an engine without this method, or one answering
+// false, cannot, and the window must not offer a choice that does nothing.
+type OwnerlessRouter interface {
+	RoutesOwnerless() bool
+}
+
 // Apply acknowledges only after the adapter has applied all parts of a policy.
 // Policy closures name their revision before Apply; acknowledgement resolves
 // its cutoff. Explicit selections such as Reconnect retain their original time.

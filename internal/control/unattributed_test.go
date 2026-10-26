@@ -16,6 +16,7 @@ import (
 // engine uses for flows without an owner. It still can't be reconnected.
 func TestUnattributedTrafficCanBePlacedOnALine(t *testing.T) {
 	c, e, _, _ := testCore(t, map[string]any{"lines": testLines()})
+	e.ownerless = true
 	ctx := context.Background()
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -65,5 +66,36 @@ func TestUnattributedTrafficCanBePlacedOnALine(t *testing.T) {
 	}
 	if len(c.pinsLocked()) != 0 || len(e.Snapshot().Policy.AppLines) != 0 {
 		t.Fatalf("pin survived clearing: %+v", c.pinsLocked())
+	}
+}
+
+// Under the sing-box adapter, which matches rules by process path only, the
+// row stays unmovable as Node shows it, though it keeps the reserved path. An
+// engine that does not say it routes ownerless flows counts as sing-box.
+func TestUnattributedTrafficIsNotOfferedALineWithoutTheNativeEngine(t *testing.T) {
+	c, e, _, _ := testCore(t, map[string]any{"lines": testLines()})
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	flow := engine.Connection{}
+	flow.ID = "1"
+	flow.Chains = []string{"line-a1"}
+	flow.Start = c.op.Clock.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	e.connections = []engine.Connection{flow}
+	if err := c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row := stateRows(t, c)[apps.UnknownApp]
+	if row == nil || row["switchable"] != false || row["reconnectable"] != false || row["path"] != apps.UnknownApp || row["name"] != unknownAppName {
+		t.Fatalf("unattributed row under sing-box: %+v", row)
+	}
+	var plain engine.Engine = struct{ engine.Engine }{e}
+	if _, ok := plain.(engine.OwnerlessRouter); ok {
+		t.Fatal("wrapper unexpectedly routes ownerless flows")
+	}
+	c.op.Engine = plain
+	if row := stateRows(t, c)[apps.UnknownApp]; row == nil || row["switchable"] != false {
+		t.Fatalf("engine without the capability: %+v", row)
 	}
 }

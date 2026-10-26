@@ -99,10 +99,13 @@ func (c *Core) describeLocked(path string) map[string]any {
 	key := apps.AppKey(path)
 	name := baseName(path)
 	// Traffic no app owns (virtual machines, WSL, containers, and connections
-	// whose program could not be found) can be placed on a line as a whole.
-	// There is no program to look up or to reconnect.
+	// whose program could not be found) can be placed on a line as a whole,
+	// but only by an engine that routes flows without an owner; under the
+	// sing-box adapter it stays where Node shows it, unmovable. There is no
+	// program to look up or to reconnect.
 	if key == apps.UnknownApp {
-		return map[string]any{"name": unknownAppName, "hasIcon": false, "switchable": true, "reconnectable": false}
+		router, ok := c.op.Engine.(engine.OwnerlessRouter)
+		return map[string]any{"name": unknownAppName, "hasIcon": false, "switchable": ok && router.RoutesOwnerless(), "reconnectable": false}
 	}
 	switchable, reconnectable := true, true
 	if key == `c:\windows\system32\svchost.exe` {

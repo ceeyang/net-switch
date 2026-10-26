@@ -148,12 +148,12 @@ test('an icon lookup that failed on a deleted version is retried once for each n
   assert.equal(calls, 2);
 });
 
-test('traffic no app owns can switch lines but not reconnect, and is never looked up', async () => {
+test('traffic no app owns can’t switch lines under sing-box or reconnect, and is never looked up', async () => {
   let calls = 0;
   const info = new AppInfo({ lookup: async () => { calls += 1; return []; } });
   for (const programPath of ['', 'unknown']) {
     assert.deepEqual(info.describe(programPath), {
-      name: UNKNOWN_APP_NAME, hasIcon: false, switchable: true, reconnectable: false,
+      name: UNKNOWN_APP_NAME, hasIcon: false, switchable: false, reconnectable: false,
     });
   }
   await info.lookupPending();

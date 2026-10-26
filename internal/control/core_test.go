@@ -155,7 +155,13 @@ type fakeEngine struct {
 	// FailureID, so only Start's result counts.
 	refuse   error
 	refusals int
+	// ownerless, when set, makes the fake answer like the native engine,
+	// which routes flows without an owning program.
+	ownerless bool
 }
+
+func (f *fakeEngine) RoutesOwnerless() bool { return f.ownerless }
+
 type recordedReply struct {
 	Route  string
 	Status int

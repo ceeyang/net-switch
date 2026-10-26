@@ -87,6 +87,18 @@ func (r *Remote) dialInstalled(ctx context.Context, e localipc.Endpoint) (*local
 	}
 	return r.dialAdapter(ctx, e)
 }
+
+// RoutesOwnerless reports whether the connected engine is the native one,
+// which routes flows without an owning program by their reserved pin. Before
+// a hello, and with the temporary sing-box dialect, it is false.
+func (r *Remote) RoutesOwnerless() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.native
+}
+
+var _ ce.OwnerlessRouter = (*Remote)(nil)
+
 func (r *Remote) Snapshot() ce.Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()

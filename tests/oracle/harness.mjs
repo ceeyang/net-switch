@@ -160,9 +160,9 @@ export async function oracle({ initial = {}, mode = 'tun', importOnly = false, a
     updateAssetName: (version, arch) => `NetSwitch-Setup-${version}-${arch}.exe`,
     protectMachineDir: async () => {}, portHolder: async () => null, stopOrphan: forbidden('stopOrphan'), killTree: forbidden('killTree'),
     createAppInfo: () => ({
-      // Like lib/appinfo.mjs, traffic no app owns can switch lines but not reconnect.
+      // Like lib/appinfo.mjs, traffic no app owns can't switch lines or reconnect under sing-box.
       describe: (programPath) => (!programPath || programPath.toLowerCase() === 'unknown'
-        ? { name: 'Virtual machines and other traffic', hasIcon: false, switchable: true, reconnectable: false }
+        ? { name: 'Virtual machines and other traffic', hasIcon: false, switchable: false, reconnectable: false }
         : { name: path.win32.basename(programPath, '.exe'), hasIcon: false, switchable: true, reconnectable: !/svchost\.exe$/i.test(programPath) }),
       lookupPending() {}, icon: () => null,
     }),
