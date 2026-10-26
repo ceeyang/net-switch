@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"net/netip"
 
+	"github.com/AyoubAchour/net-switch/internal/apppath"
 	"github.com/AyoubAchour/net-switch/internal/engine/flowapi"
 	"github.com/AyoubAchour/net-switch/internal/engine/platform"
 )
@@ -137,11 +138,22 @@ func Compile(r Revision) (*Policy, error) {
 	return p, nil
 }
 
+// appIdentity is the pin a flow's owner is looked up under. A flow without an
+// owner, such as one Windows forwards for a virtual machine, WSL or a
+// container, has no process on this PC; all of them share the reserved
+// identity, so the person can place them on a line together.
+func appIdentity(app string) string {
+	if app == "" {
+		return apppath.Unknown
+	}
+	return app
+}
+
 func (p *Policy) Decide(owner platform.Owner, sourcePort uint16, ipv6 bool, k uint64) (flowapi.Decision, error) {
 	if ipv6 && !p.config.IPv6 {
 		return flowapi.Decision{}, ErrIPv6
 	}
-	lane := p.config.AppLines[owner.AppID]
+	lane := p.config.AppLines[appIdentity(owner.AppID)]
 	if lane != "" && p.blocked[lane] {
 		return flowapi.Decision{}, ErrBlocked
 	}
@@ -165,7 +177,7 @@ func (p *Policy) Decide(owner platform.Owner, sourcePort uint16, ipv6 bool, k ui
 }
 
 func (p *Policy) Predict(app string) Prediction {
-	if lane := p.config.AppLines[app]; lane != "" {
+	if lane := p.config.AppLines[appIdentity(app)]; lane != "" {
 		return Prediction{Line: p.config.Lanes[lane], Blocked: p.blocked[lane]}
 	}
 	if p.config.Combine && p.total != 0 {

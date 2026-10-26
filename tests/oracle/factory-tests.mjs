@@ -62,3 +62,24 @@ test('engine, updates and helper options are used by startup and shutdown', asyn
   assert.equal(engine.status, 'off');
   for (const call of ['find helper', 'updates start', 'monitor start', 'monitor stop']) assert.ok(calls.includes(call), call);
 });
+
+test('traffic no app owns can be placed on a line, though sing-box rules leave it out', async () => {
+  const run = await oracle({ importOnly: true, initial: { lines } });
+  await run.start();
+  const hooks = run.server.oracleHooks;
+  const response = await run.request('POST', '/api/app-line', { path: 'unknown', line: 'b2' });
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(JSON.stringify(hooks.settings.values.appLines)), { unknown: 'b2' });
+  assert.deepEqual(JSON.parse(JSON.stringify(hooks.engine.appLines)), { unknown: 'b2' });
+  const rules = [...run.files].filter(([name]) => /\/(apps|cut)-b2\.json$/.test(name));
+  assert.equal(rules.length, 2);
+  for (const [name, text] of rules) assert.doesNotMatch(String(text), /unknown/i, name);
+  const row = response.body.apps.find((app) => app.key === 'unknown');
+  assert.equal(row.path, 'unknown');
+  assert.equal(row.line, 'b2');
+  assert.equal(row.switchable, true);
+  assert.equal(row.reconnectable, false);
+  const cleared = await run.request('POST', '/api/app-line', { path: row.path, line: null });
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(JSON.parse(JSON.stringify(hooks.settings.values.appLines)), {});
+});

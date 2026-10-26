@@ -6,6 +6,13 @@ change behavior.
 
 ## [Unreleased]
 
+- **Virtual machines can use another line.** Traffic from Hyper-V virtual
+  machines, WSL and Docker has no app on this PC, so it was shown as an
+  unknown app that always used the main line. It is now called
+  **Virtual machines and other traffic** and can be put on a line like any
+  app: all of it moves together, since Windows doesn't say which virtual
+  machine sent what.
+
 ## [0.3.1] - 2026-10-18
 
 To update, use the update offer in Net Switch or download the installer below

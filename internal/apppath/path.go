@@ -77,9 +77,17 @@ func Normalize(s string, rules Rules) string { return rules.FoldCase(parts(s, ru
 func Pattern(s string, rules Rules) string {
 	return rules.RegexFlags + "^" + parts(s, rules, true) + "$"
 }
+
+// Unknown is the identity of traffic no app owns: connections whose owner
+// could not be found, and traffic Windows forwards for virtual machines, WSL
+// and containers, which has no process on this PC. Real identities are
+// absolute paths or prefixed sandbox ids, so this name never collides with
+// one; a pin stored under it places that whole bucket on a line.
+const Unknown = "unknown"
+
 func Key(s string) string {
 	if s == "" {
-		return "unknown"
+		return Unknown
 	}
 	return Normalize(s, Windows)
 }

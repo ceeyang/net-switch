@@ -147,6 +147,15 @@ func RuleFiles(p engine.Policy) ([]RuleFile, error) {
 	order, pins := []string{}, map[string]apps.Pin{}
 	for _, pin := range p.AppLines {
 		key := apps.AppKey(pin.Path)
+		// sing-box matches rules by process path and has no rule for a
+		// connection without a process, so traffic no app owns (virtual
+		// machines, WSL, containers) cannot be placed here: its pin is kept
+		// for the native engine and left out of the rules, as Node's
+		// buildRuleSets does, rather than written as a pattern that names no
+		// program. That traffic keeps using the main line or a share.
+		if key == apps.UnknownApp {
+			continue
+		}
 		if _, exists := pins[key]; !exists {
 			order = append(order, key)
 		}

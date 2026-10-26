@@ -52,7 +52,9 @@ func (c *Core) Action(ctx context.Context, method, path string, b map[string]any
 			// never the path other sandboxes may share; a path pin for it is
 			// replaced here. On Windows the identity is the path as today.
 			identity := path
-			if tracked := c.tracker.IdentityOf(apps.AppKey(path)); tracked != "" {
+			// Traffic no app owns is pinned under its reserved identity, never
+			// a sandbox identity one of its connections reported.
+			if tracked := c.tracker.IdentityOf(apps.AppKey(path)); tracked != "" && apps.AppKey(path) != apps.UnknownApp {
 				identity = tracked
 			}
 			pins := apps.Pins{}

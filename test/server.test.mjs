@@ -11,8 +11,8 @@ test('server factory isolation and failed-write rollback', (t) => {
   });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.doesNotMatch(result.stdout + result.stderr, /recursively|skipping running files/);
-  assert.match(result.stdout, /# tests 5\b/);
-  assert.match(result.stdout, /# pass 5\b/);
+  assert.match(result.stdout, /# tests 6\b/);
+  assert.match(result.stdout, /# pass 6\b/);
   assert.match(result.stdout, /# fail 0\b/);
   t.diagnostic(result.stdout);
 });

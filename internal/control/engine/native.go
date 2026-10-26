@@ -19,7 +19,13 @@ import (
 // path pin inside a sandbox location cannot name the app the person meant (the
 // engine reports it by sandbox identity), so it compiles to nothing and is
 // shown as needing reselection rather than routed by guess.
+//
+// The reserved identity for traffic no app owns compiles to itself under both
+// rules: the engine looks it up for flows without an owner.
 func pinIdentity(value string, rules apppath.Rules) (string, bool) {
+	if apppath.Key(value) == apppath.Unknown {
+		return apppath.Unknown, true
+	}
 	if apps.SandboxIdentity(value) {
 		return value, true
 	}

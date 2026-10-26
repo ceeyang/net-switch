@@ -15,6 +15,9 @@ import (
 	"github.com/AyoubAchour/net-switch/internal/apppath"
 )
 
+// UnknownApp is the key and pin path of the row for traffic no app owns.
+const UnknownApp = apppath.Unknown
+
 func AppKey(path string) string     { return apppath.Key(path) }
 func LineOutbound(id string) string { return "line-" + id }
 func LaneSelector(id string) string { return "lane-" + id }

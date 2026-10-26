@@ -52,6 +52,15 @@ test('every line gets a file of pinned apps; every line but the main one also ge
   assert.deepEqual(buildRuleSets({ lines: [CABLE], appLines: { [LM]: 'zz' } })['apps-a1'], NEVER);
 });
 
+test('sing-box rules leave out the pin for traffic no app owns, which they can’t match', () => {
+  // Such traffic has no process path; the native engine routes it by its
+  // reserved identity, sing-box keeps it on the main line or a share.
+  const appLines = { unknown: 'b2', [LM]: 'b2' };
+  const sets = buildRuleSets({ lines: LINES, appLines, blocked: ['b2'] });
+  assert.deepEqual(sets, buildRuleSets({ lines: LINES, appLines: { [LM]: 'b2' }, blocked: ['b2'] }));
+  assert.deepEqual(buildRuleSets({ lines: LINES, appLines: { unknown: 'b2' } })['apps-b2'], NEVER);
+});
+
 test('a line out of data with nowhere to send its apps refuses their new connections', () => {
   const sets = buildRuleSets({ lines: LINES, appLines: { [LM]: 'b2' }, blocked: ['b2'] });
   assert.deepEqual(sets['cut-b2'], { version: 3, rules: [LM_RULE] });

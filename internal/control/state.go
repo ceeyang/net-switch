@@ -90,15 +90,22 @@ func baseName(path string) string {
 	}
 	return name
 }
+
+// unknownAppName is the window's name for traffic no app owns, as Node's
+// AppInfo gives it.
+const unknownAppName = "Virtual machines and other traffic"
+
 func (c *Core) describeLocked(path string) map[string]any {
 	key := apps.AppKey(path)
 	name := baseName(path)
+	// Traffic no app owns (virtual machines, WSL, containers, and connections
+	// whose program could not be found) can be placed on a line as a whole.
+	// There is no program to look up or to reconnect.
+	if key == apps.UnknownApp {
+		return map[string]any{"name": unknownAppName, "hasIcon": false, "switchable": true, "reconnectable": false}
+	}
 	switchable, reconnectable := true, true
-	if key == "unknown" {
-		name = "Unknown app"
-		switchable = false
-		reconnectable = false
-	} else if key == `c:\windows\system32\svchost.exe` {
+	if key == `c:\windows\system32\svchost.exe` {
 		name = "Windows services"
 		reconnectable = false
 	}
@@ -213,6 +220,12 @@ func (c *Core) State() map[string]any {
 		row := c.describeLocked(a.Path)
 		row["key"] = a.Key
 		row["path"] = a.Path
+		// The row for traffic no app owns has no program path. The window and
+		// the tray send the row's path to choose its line, so it carries the
+		// reserved identity its pin is stored under.
+		if a.Key == apps.UnknownApp {
+			row["path"] = apps.UnknownApp
+		}
 		row["line"] = a.Line
 		row["rate"] = rateJSON(&a.Rate)
 		row["lineDown"] = a.LineDown

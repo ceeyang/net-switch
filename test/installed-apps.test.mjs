@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AppInfo } from '../lib/appinfo.mjs';
+import { AppInfo, UNKNOWN_APP_NAME } from '../lib/appinfo.mjs';
 import { appKey } from '../lib/apps.mjs';
 import { InstalledApps } from '../lib/installed-apps.mjs';
 
@@ -146,4 +146,16 @@ test('an icon lookup that failed on a deleted version is retried once for each n
   info.describe(oldPath);
   assert.equal(info.pending.size, 0, 'a failed retry also stays cached');
   assert.equal(calls, 2);
+});
+
+test('traffic no app owns can switch lines but not reconnect, and is never looked up', async () => {
+  let calls = 0;
+  const info = new AppInfo({ lookup: async () => { calls += 1; return []; } });
+  for (const programPath of ['', 'unknown']) {
+    assert.deepEqual(info.describe(programPath), {
+      name: UNKNOWN_APP_NAME, hasIcon: false, switchable: true, reconnectable: false,
+    });
+  }
+  await info.lookupPending();
+  assert.equal(calls, 0);
 });
