@@ -30,3 +30,11 @@ form.addEventListener('submit', async event => {
     button.textContent = 'Connect';
   }
 });
+// The app window opened by Net Switch carries the one-time code itself; take
+// it out of the address before submitting so it never stays in history.
+const handed = /^#code=(\d{6})$/.exec(location.hash);
+if (handed) {
+  history.replaceState(null, '', location.pathname);
+  code.value = handed[1];
+  form.requestSubmit();
+}
