@@ -357,6 +357,13 @@ func (r *Remote) classifyExit(instance string, status service.Status) (exitClass
 	if status.Cleanup == "complete" && status.ExitKnown && status.ExitCode == 0 && out.Reason == "stop" && out.Error == "" {
 		return exitClass{reason: exitStopped}, nil
 	}
+	// Windows shutting down stops the engine without an exit code Control can
+	// read after the next boot. The service has not run since, and cleanup
+	// completed, so the instance ended with that Windows session: routing is
+	// off and resumes from the journaled intent, rather than a spent failure.
+	if status.Cleanup == "complete" && status.NotRunSinceBoot {
+		return exitClass{reason: exitStopped}, nil
+	}
 	return exitClass{}, nil
 }
 

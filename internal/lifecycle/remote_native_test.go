@@ -615,6 +615,15 @@ func TestRetainedNativeExitIsClassifiedAtStartup(t *testing.T) {
 	if err := stopped.remote.classifyRetainedExit(ctx, data); err != nil || stopped.remote.Snapshot().Status != "off" || stopped.remote.Snapshot().FailureID != "" {
 		t.Fatal("clean retained stop counted", stopped.remote.Snapshot(), err)
 	}
+	// Windows shut down with the engine: the service has not run since this
+	// boot, so it has no exit code, but its cleanup completed. That instance
+	// ended with the previous Windows session; it is off, not a failure.
+	rebooted := newNativeFixture(t, nativeProber{})
+	rebooted.status = service.Status{Stopped: true, Cleanup: "complete", NotRunSinceBoot: true, LastError: "main exit code unavailable"}
+	rebooted.outcome = host.Outcome{Instance: instance, State: "complete"}
+	if err := rebooted.remote.classifyRetainedExit(ctx, data); err != nil || rebooted.remote.Snapshot().Status != "off" || rebooted.remote.Snapshot().FailureID != "" {
+		t.Fatal("an engine that ended with the previous boot counted as a failure", rebooted.remote.Snapshot(), err)
+	}
 	running := newNativeFixture(t, nativeProber{})
 	running.status = service.Status{Running: true, PID: 7}
 	if err := running.remote.classifyRetainedExit(ctx, data); err != nil || running.remote.Snapshot().Status != "off" || running.remote.instance != "" {

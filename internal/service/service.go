@@ -36,6 +36,10 @@ type Status struct {
 	ManagerInvocation string `json:"managerInvocation,omitempty"`
 	ManagerBootID     string `json:"managerBootId,omitempty"`
 	MainExitSource    string `json:"mainExitSource,omitempty"`
+	// NotRunSinceBoot is Windows' ERROR_SERVICE_NEVER_STARTED: the service
+	// has not run since Windows started (or since it was installed), so any
+	// retained instance ended with an earlier Windows session.
+	NotRunSinceBoot bool `json:"notRunSinceBoot,omitempty"`
 }
 
 // ExitCode accepts only a direct, completed outcome. In particular, joining
