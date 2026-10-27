@@ -32,6 +32,12 @@ func main() {
 		fmt.Println(value)
 		return
 	}
+	// A second launch hands its request to the running copy and exits.
+	if !lifecycle.ClaimDesktop(!*background) {
+		return
+	}
+	lifecycle.StartTray()
+	defer lifecycle.StopTray()
 	if err := lifecycle.Desktop(ctx, !*background); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

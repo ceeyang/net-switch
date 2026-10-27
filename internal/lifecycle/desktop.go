@@ -15,6 +15,17 @@ import (
 // real service endpoint.
 var dialIPC = localipc.Dial
 
+// desktopShow carries a later launch's or the tray's request to show the
+// window; desktopRouting and desktopQuit carry the tray menu's choices.
+var (
+	desktopShow    = make(chan struct{}, 1)
+	desktopRouting = make(chan bool, 1)
+	desktopQuit    = make(chan struct{}, 1)
+)
+
+// errDesktopQuit ends the desktop process after the tray's Quit.
+var errDesktopQuit = errors.New("quit from the tray")
+
 func controlEndpoint(kind string) localipc.Endpoint {
 	return localipc.Endpoint{Path: localipc.DefaultPath(kind), Kind: kind, Service: service.Control}
 }
@@ -177,7 +188,9 @@ func Desktop(ctx context.Context, show bool) error {
 		}
 		err = desktopSession(ctx, rpc, show, registered)
 		rpc.Close()
-		if ctx.Err() != nil {
+		// After a reconnect, pair again only a window that is still open.
+		show = desktopWindowOpen()
+		if ctx.Err() != nil || errors.Is(err, errDesktopQuit) {
 			return nil
 		}
 		fmt.Println("Net Switch connection lost; reconnecting:", err)
@@ -211,24 +224,59 @@ func desktopSession(ctx context.Context, rpc *RPC, show, registered bool) error 
 			return err
 		}
 	}
-	if show {
+	pair := func() error {
 		var code string
 		if err := rpc.Call(ctx, map[string]any{"method": "pair"}, &code); err != nil {
 			return err
 		}
-		if err := ShowPairing(session.URL+"pair", code, session.Owner); err != nil {
+		return ShowPairing(session.URL+"pair", code, session.Owner)
+	}
+	if show {
+		if err := pair(); err != nil {
 			return err
 		}
 	}
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
+	polls := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-desktopShow:
+			// Net Switch was opened again: reuse the window, or pair a new one.
+			if !focusOpenWindow() {
+				if err := pair(); err != nil {
+					return err
+				}
+			}
+		case on := <-desktopRouting:
+			if err := rpc.Call(ctx, map[string]any{"method": "routing", "on": on}, nil); err != nil {
+				go func() {
+					_ = ShowStatus(fmt.Sprintf("Net Switch could not turn routing %s: %v", map[bool]string{true: "on", false: "off"}[on], err))
+				}()
+			}
+		case <-desktopQuit:
+			// Quit as Node's tray does: routing off, so every app goes back to
+			// Windows' normal connection, then close the window and the icon.
+			if err := rpc.Call(ctx, map[string]any{"method": "routing", "on": false}, nil); err != nil {
+				go func() { _ = ShowStatus(fmt.Sprintf("Net Switch could not turn routing off: %v", err)) }()
+				continue
+			}
+			closeDesktopWindow()
+			return errDesktopQuit
 		case <-rpc.Done():
 			return fmt.Errorf("Control restarted")
 		case <-tick.C:
+			// Keep the tray's tooltip and menu in step about every two seconds.
+			if polls++; polls%8 == 1 {
+				var state struct {
+					Routing string `json:"routing"`
+				}
+				if err := rpc.Call(ctx, map[string]any{"method": "status"}, &state); err == nil {
+					setTrayRouting(state.Routing)
+				}
+			}
 			var tasks []DesktopWork
 			if err := rpc.Call(ctx, map[string]any{"method": "desktop-poll"}, &tasks); err != nil {
 				return err

@@ -80,8 +80,9 @@ func openAppWindow(url string) bool {
 func ShowPairing(url, code, owner string) error {
 	// The app window is opened by this owner-only process, so it carries the
 	// one-time code itself and the pairing page submits it; the service still
-	// checks that the caller is the enrolled owner.
-	if openAppWindow(url + "#code=" + code) {
+	// checks that the caller is the enrolled owner. The native window comes
+	// first; Edge's app window is kept for a PC whose WebView2 is broken.
+	if openNativeWindow(url+"#code="+code) || openAppWindow(url+"#code="+code) {
 		return nil
 	}
 	verb, _ := windows.UTF16PtrFromString("open")

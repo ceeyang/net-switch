@@ -56,6 +56,17 @@ func ShowPairing(url, code, owner string) error {
 	return nil
 }
 func ShowStatus(message string) error { return notify("Net Switch", message) }
+
+// The browser owns the window on Linux, so there is no window to track.
+func ClaimDesktop(show bool) bool { return true }
+func desktopWindowOpen() bool     { return false }
+func focusOpenWindow() bool       { return false }
+func closeDesktopWindow()         {}
+
+// Linux desktops show status through notifications, not a tray icon.
+func StartTray()                    {}
+func StopTray()                     {}
+func setTrayRouting(routing string) {}
 func notify(title, message string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

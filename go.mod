@@ -4,6 +4,7 @@ go 1.27.3
 
 require (
 	github.com/godbus/dbus/v5 v5.2.4
+	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/quic-go/quic-go v0.64.0
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.49.0
@@ -13,6 +14,7 @@ require (
 
 require (
 	github.com/google/btree v1.1.2 // indirect
+	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
