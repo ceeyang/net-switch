@@ -274,6 +274,15 @@ func (c *Core) State() map[string]any {
 	_, policyChanged := js.Object(undo["policy"])["value"]
 	_, others := c.outrankingLocked()
 	updates := c.op.Mode != "proxy" && c.values["checkForUpdates"] == true
+	settingsOut := map[string]any{
+		"autostart": autostart, "checkForUpdates": updates,
+		"probeTargets": probeTargets(c.values["probeTargets"], c.values["probeTargetsCustom"] == true),
+	}
+	// Only the native engine offers the switch; the sing-box adapter keeps
+	// Node's state shape, which always fails over.
+	if router, ok := c.op.Engine.(engine.OwnerlessRouter); ok && router.RoutesOwnerless() {
+		settingsOut["failover"] = c.values["failover"] != false
+	}
 	return map[string]any{
 		"mode": c.op.Mode, "elevated": c.elevated, "version": c.op.Version,
 		"update": offer, "updateChecks": updates,
@@ -285,11 +294,8 @@ func (c *Core) State() map[string]any {
 			"proxyPort": s.ProxyPort, "ipv6": ipv6, "retryAt": retryAt,
 		},
 		"lines": ll, "candidates": candidates, "apps": appRows,
-		"events": append([]map[string]any{}, c.events...),
-		"settings": map[string]any{
-			"autostart": autostart, "checkForUpdates": updates,
-			"probeTargets": probeTargets(c.values["probeTargets"], c.values["probeTargetsCustom"] == true),
-		},
+		"events":   append([]map[string]any{}, c.events...),
+		"settings": settingsOut,
 		"setup": map[string]any{
 			"cableNotDefault": len(others) > 0, "wifiBlocked": c.policy == float64(3) && wifi,
 			"keepBothConnected": len(items) > 1 && hasWifiLine && c.policy != float64(0) && c.policy != float64(3),

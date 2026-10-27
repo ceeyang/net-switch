@@ -431,11 +431,14 @@ func (c *Core) reconnect(ctx context.Context, key string) (map[string]any, error
 	return map[string]any{"closed": closed, "failed": failed, "gone": gone}, nil
 }
 func (c *Core) changeSettings(ctx context.Context, b map[string]any) error {
-	for _, key := range []string{"checkForUpdates", "autostart"} {
+	for _, key := range []string{"checkForUpdates", "autostart", "failover"} {
 		if v, exists := b[key]; exists {
 			if _, ok := v.(bool); !ok {
 				if key == "autostart" {
 					return bad("Choose whether Net Switch starts with Windows, then try again.")
+				}
+				if key == "failover" {
+					return bad("Choose whether apps may switch lines by themselves, then try again.")
 				}
 				return bad("Choose whether to check for updates, then try again.")
 			}
@@ -491,8 +494,22 @@ func (c *Core) changeSettings(ctx context.Context, b map[string]any) error {
 	if v, exists := b["checkForUpdates"]; exists {
 		changes["checkForUpdates"] = v
 	}
+	_, failover := b["failover"]
+	if failover {
+		changes["failover"] = b["failover"]
+	}
 	if err := c.save(changes); err != nil {
 		return err
+	}
+	if failover {
+		word := "off: a line without internet keeps its apps"
+		if b["failover"] == true {
+			word = "on"
+		}
+		c.log("switching lines automatically is %s", word)
+		if err := c.ApplyPolicy(ctx); err != nil {
+			return err
+		}
 	}
 	if changes["checkForUpdates"] == true {
 		_, err := c.CheckUpdate(ctx, false)

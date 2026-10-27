@@ -2340,6 +2340,22 @@ function buildSettingsPanel() {
       }),
     );
   }
+  // Only the native service reports this setting; Node always switches.
+  if (typeof settings.failover === 'boolean') {
+    rows.push(
+      switchRow({
+        id: 'setting-failover',
+        name: 'Switch lines automatically',
+        help: settings.failover
+          ? 'If a line drops or loses internet, its apps move to the next line that works.'
+          : 'Apps stay on their line even when it has no internet or is disconnected. They go offline instead of using another line.',
+        checked: settings.failover,
+        busy: busyAction === 'failover',
+        disabled: busy,
+        onToggle: () => run('failover', () => api('/api/settings', { failover: !settings.failover })),
+      }),
+    );
+  }
   // Test mode never checks for updates, so it offers no switch for it.
   const checks = updateChecksValue();
   if (checks !== null && state.mode !== 'proxy') {

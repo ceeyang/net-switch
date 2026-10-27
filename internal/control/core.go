@@ -667,8 +667,15 @@ func (c *Core) policyLocked() engine.Policy {
 			p.Shares = append(lines.Shares{}, current.Policy.Shares...)
 		}
 	}
+	// With automatic switching off, a line without internet keeps its apps:
+	// their connections fail instead of leaving on another line. Data caps
+	// still move apps, since the person chose that per line.
+	failover := c.values["failover"] != false
 	for i, l := range items {
 		t := lines.LaneTarget(items, l.ID, up, c.exhausted)
+		if t != nil && !failover && !c.exhausted[l.ID] {
+			t = &items[i].ID
+		}
 		if t != nil {
 			p.Lanes[l.ID] = *t
 			if i > 0 && c.exhausted[l.ID] && *t == l.ID {

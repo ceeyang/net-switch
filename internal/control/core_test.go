@@ -698,6 +698,28 @@ func TestFailedStatisticsReadDoesNotPreventFailover(t *testing.T) {
 	}
 }
 
+func TestFailoverOffKeepsAppsOnADeadLine(t *testing.T) {
+	c, e, clock, _ := testCore(t, map[string]any{"lines": testLines(), "failover": false})
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.adapters[0]["ipv4s"] = []any{}
+	for i := 0; i < 2; i++ {
+		clock.advance(1000)
+		_ = c.Poll(context.Background())
+	}
+	if got := e.Snapshot().Policy.Lanes["a1"]; got != "a1" {
+		t.Fatalf("dead main lane moved to %q with automatic switching off", got)
+	}
+	// Turning it back on moves the apps at once.
+	if err := c.changeSettings(context.Background(), map[string]any{"failover": true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Snapshot().Policy.Lanes["a1"]; got != "b2" {
+		t.Fatalf("dead main lane stayed on %q after switching was turned on", got)
+	}
+}
+
 func TestSupervisorDoesNotRepeatACompletedRebind(t *testing.T) {
 	c, e, clock, _ := testCore(t, map[string]any{"lines": testLines()})
 	if err := c.Start(context.Background()); err != nil {
